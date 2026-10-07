@@ -1,0 +1,27 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1791369644553,
+      "tag": "0000_robust_magdalene",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1791379355785,
+      "tag": "0001_yielding_hellfire_club",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1791379490380,
+      "tag": "0002_mature_mister_fear",
+      "breakpoints": true
+    }
+  ]
+}
