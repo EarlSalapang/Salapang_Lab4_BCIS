@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export * from "./catalog.js";
+
 export const apiHealthSchema = z.object({
   status: z.literal("ok"),
   service: z.literal("bcis-api"),
@@ -59,3 +61,5 @@ export type DesktopAuthResult =
 export type DesktopAdminResult<T> =
   | { ok: true; data: T }
   | { ok: false; message: string };
+
+export type DesktopResult<T> = DesktopAdminResult<T>;

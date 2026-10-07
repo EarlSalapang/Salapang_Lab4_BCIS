@@ -1,10 +1,26 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
   AuthUser,
+  CollectionArea,
+  CreateCollectionAreaInput,
+  CreatePlanInput,
+  CreateServiceAccountInput,
+  CreateSubscriberInput,
   DesktopAdminResult,
   DesktopApiHealth,
   DesktopAuthResult,
+  DesktopResult,
   ManagedUser,
+  ServiceAccountDetail,
+  ServiceAccountListResponse,
+  ServiceAccountStatus,
+  ServicePlan,
+  SubscriberDetail,
+  SubscriberListResponse,
+  SubscriberStatus,
+  UpdatePlanInput,
+  UpdateServiceAccountInput,
+  UpdateSubscriberInput,
 } from "@bcis/shared";
 
 contextBridge.exposeInMainWorld("bcis", {
@@ -25,4 +41,48 @@ contextBridge.exposeInMainWorld("bcis", {
     password: string;
     role: string;
   }): Promise<DesktopAdminResult<ManagedUser>> => ipcRenderer.invoke("bcis:admin-create-user", input),
+  listPlans: (includeInactive = false): Promise<DesktopResult<{ plans: ServicePlan[] }>> =>
+    ipcRenderer.invoke("bcis:list-plans", includeInactive),
+  createPlan: (input: CreatePlanInput): Promise<DesktopResult<{ plan: ServicePlan }>> =>
+    ipcRenderer.invoke("bcis:create-plan", input),
+  updatePlan: (id: string, input: UpdatePlanInput): Promise<DesktopResult<{ plan: ServicePlan }>> =>
+    ipcRenderer.invoke("bcis:update-plan", { id, input }),
+  listCollectionAreas: (): Promise<DesktopResult<{ areas: CollectionArea[] }>> =>
+    ipcRenderer.invoke("bcis:list-collection-areas"),
+  createCollectionArea: (input: CreateCollectionAreaInput): Promise<DesktopResult<{ area: CollectionArea }>> =>
+    ipcRenderer.invoke("bcis:create-collection-area", input),
+  listSubscribers: (params?: {
+    query?: string;
+    status?: SubscriberStatus;
+    collectionAreaId?: string;
+    page?: number;
+    pageSize?: number;
+  }): Promise<DesktopResult<SubscriberListResponse>> => ipcRenderer.invoke("bcis:list-subscribers", params),
+  getSubscriber: (id: string): Promise<DesktopResult<{ subscriber: SubscriberDetail }>> =>
+    ipcRenderer.invoke("bcis:get-subscriber", id),
+  createSubscriber: (input: CreateSubscriberInput): Promise<DesktopResult<{ subscriber: SubscriberDetail }>> =>
+    ipcRenderer.invoke("bcis:create-subscriber", input),
+  updateSubscriber: (
+    id: string,
+    input: UpdateSubscriberInput,
+  ): Promise<DesktopResult<{ subscriber: SubscriberDetail }>> =>
+    ipcRenderer.invoke("bcis:update-subscriber", { id, input }),
+  listServiceAccounts: (params?: {
+    query?: string;
+    status?: ServiceAccountStatus;
+    page?: number;
+    pageSize?: number;
+  }): Promise<DesktopResult<ServiceAccountListResponse>> => ipcRenderer.invoke("bcis:list-service-accounts", params),
+  getServiceAccount: (id: string): Promise<DesktopResult<{ serviceAccount: ServiceAccountDetail }>> =>
+    ipcRenderer.invoke("bcis:get-service-account", id),
+  createServiceAccount: (
+    subscriberId: string,
+    input: CreateServiceAccountInput,
+  ): Promise<DesktopResult<{ serviceAccount: ServiceAccountDetail }>> =>
+    ipcRenderer.invoke("bcis:create-service-account", { id: subscriberId, input }),
+  updateServiceAccount: (
+    id: string,
+    input: UpdateServiceAccountInput,
+  ): Promise<DesktopResult<{ serviceAccount: ServiceAccountDetail }>> =>
+    ipcRenderer.invoke("bcis:update-service-account", { id, input }),
 });

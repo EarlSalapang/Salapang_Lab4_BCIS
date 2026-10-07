@@ -1,9 +1,24 @@
 import Fastify from "fastify";
-import { createUserInputSchema, loginInputSchema } from "@bcis/shared";
+import type { FastifyReply, FastifyRequest } from "fastify";
+import {
+  createCollectionAreaInputSchema,
+  createPlanInputSchema,
+  createServiceAccountInputSchema,
+  createSubscriberInputSchema,
+  createUserInputSchema,
+  identifierSchema,
+  loginInputSchema,
+  serviceAccountListQuerySchema,
+  subscriberListQuerySchema,
+  updatePlanInputSchema,
+  updateServiceAccountInputSchema,
+  updateSubscriberInputSchema,
+} from "@bcis/shared";
 import type { AuthUser } from "@bcis/shared";
 
 import { AuthError, AuthService, hashPassword } from "./auth/service.js";
 import type { AuthStore } from "./auth/types.js";
+import { CatalogError, type DirectoryStore } from "./catalog/types.js";
 
 export interface HealthQuery {
   query: (queryText: string) => Promise<unknown>;
@@ -23,8 +38,13 @@ function getBearerToken(authorization: string | undefined): string | null {
 export function buildServer(
   database: HealthQuery,
   authStore: AuthStore,
-  options: { disableLogging?: boolean; https?: { cert: Buffer; key: Buffer } } = {},
+  options: {
+    disableLogging?: boolean;
+    https?: { cert: Buffer; key: Buffer };
+    directory?: DirectoryStore;
+  } = {},
 ) {
+  const directory = options.directory;
   const server = Fastify({
     bodyLimit: 16 * 1024,
     ...(options.https ? { https: options.https } : {}),
@@ -50,6 +70,36 @@ export function buildServer(
     return reply.code(401).send({ error: "Session is invalid or expired." });
   }
   };
+
+  const requirePermission = (permission: string, message: string) =>
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      await authenticate(request, reply);
+      if (reply.sent) return;
+      if (!request.authUser?.permissions.includes(permission)) {
+        return reply.code(403).send({ error: message });
+      }
+    };
+
+  const requireDirectory = (reply: FastifyReply): DirectoryStore | null => {
+    if (!directory) {
+      void reply.code(503).send({ error: "Directory services are not available." });
+      return null;
+    }
+    return directory;
+  };
+
+  const sendError = (request: FastifyRequest, reply: FastifyReply, error: unknown) => {
+    if (error instanceof CatalogError) {
+      return reply.code(error.statusCode).send({ error: error.message });
+    }
+    request.log.error({ err: error }, "request failed");
+    return reply.code(500).send({ error: "Unable to complete the request." });
+  };
+
+  const actorOf = (request: FastifyRequest) => ({
+    userId: request.authUser?.id ?? null,
+    displayName: request.authUser?.displayName ?? "System",
+  });
 
   server.get("/health", async () => ({
     status: "ok",
@@ -102,43 +152,19 @@ export function buildServer(
 
   server.get(
     "/admin/users",
-    {
-      preHandler: async (request, reply) => {
-        await authenticate(request, reply);
-        if (reply.sent) return;
-        if (!request.authUser?.permissions.includes("user.manage")) {
-          return reply.code(403).send({ error: "You do not have permission to manage users." });
-        }
-      },
-    },
+    { preHandler: requirePermission("user.manage", "You do not have permission to manage users.") },
     async () => ({ users: await authStore.listUsers() }),
   );
 
   server.get(
     "/admin/roles",
-    {
-      preHandler: async (request, reply) => {
-        await authenticate(request, reply);
-        if (reply.sent) return;
-        if (!request.authUser?.permissions.includes("user.manage")) {
-          return reply.code(403).send({ error: "You do not have permission to manage users." });
-        }
-      },
-    },
+    { preHandler: requirePermission("user.manage", "You do not have permission to manage users.") },
     async () => ({ roles: await authStore.listAssignableRoles() }),
   );
 
   server.post(
     "/admin/users",
-    {
-      preHandler: async (request, reply) => {
-        await authenticate(request, reply);
-        if (reply.sent) return;
-        if (!request.authUser?.permissions.includes("user.manage")) {
-          return reply.code(403).send({ error: "You do not have permission to manage users." });
-        }
-      },
-    },
+    { preHandler: requirePermission("user.manage", "You do not have permission to manage users.") },
     async (request, reply) => {
       const parsed = createUserInputSchema.safeParse(request.body);
       if (!parsed.success) return reply.code(400).send({ error: "Enter valid user details and an allowed role." });
@@ -164,6 +190,187 @@ export function buildServer(
       }
     },
   );
+
+  const viewDirectory = requirePermission("subscriber.view", "You do not have permission to view subscribers.");
+  const createSubscribers = requirePermission("subscriber.create", "You do not have permission to create subscribers.");
+  const updateSubscribers = requirePermission("subscriber.update", "You do not have permission to update subscriber records.");
+  const managePlans = requirePermission("plan.manage", "You do not have permission to manage service plans.");
+  const manageCollections = requirePermission("collection.manage", "You do not have permission to manage collection areas.");
+
+  const parseIdentifier = (reply: FastifyReply, value: unknown, resource: string) => {
+    const parsed = identifierSchema.safeParse(value);
+    if (!parsed.success) {
+      void reply.code(400).send({ error: `Enter a valid ${resource} identifier.` });
+      return null;
+    }
+    return parsed.data;
+  };
+
+  server.get("/plans", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const includeInactive = (request.query as { includeInactive?: unknown } | undefined)?.includeInactive === "true";
+    try {
+      return { plans: await store.listPlans(includeInactive) };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/plans", { preHandler: managePlans }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = createPlanInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid service plan details." });
+    try {
+      return reply.code(201).send({ plan: await store.createPlan(parsed.data) });
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.patch("/plans/:id", { preHandler: managePlans }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "service plan");
+    if (!id) return;
+    const parsed = updatePlanInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid service plan details." });
+    try {
+      return { plan: await store.updatePlan(id, parsed.data) };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/collection-areas", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    try {
+      return { areas: await store.listCollectionAreas() };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/collection-areas", { preHandler: manageCollections }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = createCollectionAreaInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid collection area details." });
+    try {
+      return reply.code(201).send({ area: await store.createCollectionArea(parsed.data) });
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/subscribers", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = subscriberListQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid subscriber list filters." });
+    try {
+      return await store.listSubscribers(parsed.data);
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/subscribers", { preHandler: createSubscribers }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = createSubscriberInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid subscriber details." });
+    try {
+      return reply.code(201).send({ subscriber: await store.createSubscriber(parsed.data) });
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/subscribers/:id", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "subscriber");
+    if (!id) return;
+    try {
+      const subscriber = await store.getSubscriber(id);
+      if (!subscriber) return reply.code(404).send({ error: "Subscriber was not found." });
+      return { subscriber };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.patch("/subscribers/:id", { preHandler: updateSubscribers }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "subscriber");
+    if (!id) return;
+    const parsed = updateSubscriberInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid subscriber details." });
+    try {
+      return { subscriber: await store.updateSubscriber(id, parsed.data) };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/service-accounts", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = serviceAccountListQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid service account list filters." });
+    try {
+      return await store.listServiceAccounts(parsed.data);
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/service-accounts/:id", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "service account");
+    if (!id) return;
+    try {
+      const serviceAccount = await store.getServiceAccount(id);
+      if (!serviceAccount) return reply.code(404).send({ error: "Service account was not found." });
+      return { serviceAccount };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/subscribers/:id/service-accounts", { preHandler: createSubscribers }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "subscriber");
+    if (!id) return;
+    const parsed = createServiceAccountInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid service account details." });
+    try {
+      const serviceAccount = await store.createServiceAccount(id, parsed.data, actorOf(request));
+      return reply.code(201).send({ serviceAccount });
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.patch("/service-accounts/:id", { preHandler: updateSubscribers }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "service account");
+    if (!id) return;
+    const parsed = updateServiceAccountInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid service account details." });
+    try {
+      return { serviceAccount: await store.updateServiceAccount(id, parsed.data, actorOf(request)) };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
 
   return server;
 }

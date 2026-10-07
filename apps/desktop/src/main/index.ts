@@ -2,13 +2,30 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import {
   apiHealthSchema,
   authUserSchema,
+  collectionAreaListSchema,
+  collectionAreaResponseSchema,
+  createCollectionAreaInputSchema,
+  createPlanInputSchema,
+  createServiceAccountInputSchema,
+  createSubscriberInputSchema,
   createUserInputSchema,
+  identifierSchema,
   loginInputSchema,
   loginResponseSchema,
   managedUserSchema,
+  serviceAccountListSchema,
+  serviceAccountResponseSchema,
+  servicePlanListSchema,
+  servicePlanResponseSchema,
   stringArraySchema,
+  subscriberListSchema,
+  subscriberResponseSchema,
+  updatePlanInputSchema,
+  updateServiceAccountInputSchema,
+  updateSubscriberInputSchema,
 } from "@bcis/shared";
 import type { DesktopApiHealth, ManagedUser } from "@bcis/shared";
+import type { ZodType } from "zod";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -183,6 +200,155 @@ function zodArrayOfManagedUsers(body: unknown): ManagedUser[] | null {
   const result = managedUserSchema.array().safeParse(body.users);
   return result.success ? result.data : null;
 }
+
+function queryString(params: Record<string, string | number | undefined>): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value === undefined || value === "") continue;
+    search.set(key, String(value));
+  }
+  const encoded = search.toString();
+  return encoded ? `?${encoded}` : "";
+}
+
+function listParams(input: unknown, allowed: readonly string[]): Record<string, string | number | undefined> {
+  const source = typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
+  const output: Record<string, string | number | undefined> = {};
+  for (const key of allowed) {
+    const value = source[key];
+    if (typeof value === "string" && value.length > 0) output[key] = value;
+    else if (typeof value === "number" && Number.isFinite(value)) output[key] = value;
+  }
+  return output;
+}
+
+async function directoryRequest<T>(
+  pathname: string,
+  schema: ZodType<T>,
+  init: { method?: string; body?: unknown } = {},
+): Promise<{ ok: true; data: T } | { ok: false; message: string }> {
+  if (!sessionToken) return { ok: false, message: "Sign in to continue." };
+  try {
+    const response = await requestApi(pathname, {
+      method: init.method ?? "GET",
+      ...(init.body !== undefined
+        ? { headers: { "content-type": "application/json" }, body: JSON.stringify(init.body) }
+        : {}),
+    });
+    if (response.status === 401) sessionToken = null;
+    if (!response.ok) return { ok: false, message: await apiError(response) };
+    const parsed = schema.safeParse(await response.json());
+    return parsed.success
+      ? { ok: true, data: parsed.data }
+      : { ok: false, message: "The server returned an invalid response." };
+  } catch {
+    return { ok: false, message: "Unable to reach the central API server." };
+  }
+}
+
+function identifierResult(input: unknown): { ok: true; data: string } | { ok: false; message: string } {
+  const parsed = identifierSchema.safeParse(input);
+  return parsed.success
+    ? { ok: true, data: parsed.data }
+    : { ok: false, message: "Enter a valid record identifier." };
+}
+
+function splitPayload(payload: unknown): { ok: true; id: string; input: unknown } | { ok: false; message: string } {
+  const source = typeof payload === "object" && payload !== null ? (payload as { id?: unknown; input?: unknown }) : {};
+  const identifier = identifierResult(source.id);
+  if (!identifier.ok) return identifier;
+  return { ok: true, id: identifier.data, input: source.input };
+}
+
+ipcMain.handle("bcis:list-plans", (_event, includeInactive: unknown) =>
+  directoryRequest(
+    `/plans${queryString({ includeInactive: includeInactive === true ? "true" : "" })}`,
+    servicePlanListSchema,
+  ));
+
+ipcMain.handle("bcis:create-plan", (_event, input: unknown) => {
+  const parsed = createPlanInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Enter valid service plan details." };
+  return directoryRequest("/plans", servicePlanResponseSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:update-plan", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return split;
+  const parsed = updatePlanInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Enter valid service plan details." };
+  return directoryRequest(`/plans/${split.id}`, servicePlanResponseSchema, { method: "PATCH", body: parsed.data });
+});
+
+ipcMain.handle("bcis:list-collection-areas", () =>
+  directoryRequest("/collection-areas", collectionAreaListSchema));
+
+ipcMain.handle("bcis:create-collection-area", (_event, input: unknown) => {
+  const parsed = createCollectionAreaInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Enter valid collection area details." };
+  return directoryRequest("/collection-areas", collectionAreaResponseSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:list-subscribers", (_event, params: unknown) =>
+  directoryRequest(
+    `/subscribers${queryString(listParams(params, ["query", "status", "collectionAreaId", "page", "pageSize"]))}`,
+    subscriberListSchema,
+  ));
+
+ipcMain.handle("bcis:get-subscriber", (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  return directoryRequest(`/subscribers/${identifier.data}`, subscriberResponseSchema);
+});
+
+ipcMain.handle("bcis:create-subscriber", (_event, input: unknown) => {
+  const parsed = createSubscriberInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Enter valid subscriber details." };
+  return directoryRequest("/subscribers", subscriberResponseSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:update-subscriber", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return split;
+  const parsed = updateSubscriberInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Enter valid subscriber details." };
+  return directoryRequest(`/subscribers/${split.id}`, subscriberResponseSchema, { method: "PATCH", body: parsed.data });
+});
+
+ipcMain.handle("bcis:list-service-accounts", (_event, params: unknown) =>
+  directoryRequest(
+    `/service-accounts${queryString(listParams(params, ["query", "status", "page", "pageSize"]))}`,
+    serviceAccountListSchema,
+  ));
+
+ipcMain.handle("bcis:get-service-account", (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  return directoryRequest(`/service-accounts/${identifier.data}`, serviceAccountResponseSchema);
+});
+
+ipcMain.handle("bcis:create-service-account", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return split;
+  const parsed = createServiceAccountInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Enter valid service account details." };
+  return directoryRequest(`/subscribers/${split.id}/service-accounts`, serviceAccountResponseSchema, {
+    method: "POST",
+    body: parsed.data,
+  });
+});
+
+ipcMain.handle("bcis:update-service-account", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return split;
+  const parsed = updateServiceAccountInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Enter valid service account details." };
+  return directoryRequest(`/service-accounts/${split.id}`, serviceAccountResponseSchema, {
+    method: "PATCH",
+    body: parsed.data,
+  });
+});
+
 
 function createWindow() {
   const window = new BrowserWindow({

@@ -1,15 +1,8 @@
 import { hashPassword } from "./auth/passwords.js";
 import { pool } from "./db/client.js";
 
-const username = process.env.BCIS_INITIAL_ADMIN_USERNAME?.trim().toLowerCase();
-const password = process.env.BCIS_INITIAL_ADMIN_PASSWORD;
-
-if (!username || username.length < 3 || username.length > 64 || !/^[a-z0-9._-]+$/.test(username)) {
-  throw new Error("Set BCIS_INITIAL_ADMIN_USERNAME to 3-64 lowercase letters, numbers, dots, underscores, or hyphens.");
-}
-if (!password || password.length < 12 || password.length > 128) {
-  throw new Error("Set BCIS_INITIAL_ADMIN_PASSWORD to a password between 12 and 128 characters.");
-}
+const usernameInput = process.env.BCIS_INITIAL_ADMIN_USERNAME?.trim().toLowerCase();
+const passwordInput = process.env.BCIS_INITIAL_ADMIN_PASSWORD;
 
 const roleDefinitions = [
   ["Owner / Super Admin", "Full system access and configuration."],
@@ -23,6 +16,10 @@ const roleDefinitions = [
 
 const permissionDefinitions = [
   ["subscriber.view", "View subscriber records."],
+  ["subscriber.create", "Create subscribers and service accounts."],
+  ["subscriber.update", "Update subscriber and service account records."],
+  ["plan.manage", "Manage service plans and pricing."],
+  ["collection.manage", "Manage collection areas, routes, and collectors."],
   ["billing.generate", "Generate billing invoices."],
   ["payment.create", "Post subscriber payments."],
   ["payment.reverse", "Reverse posted payments."],
@@ -42,7 +39,7 @@ const roleGrants: Record<string, readonly string[]> = {
     .map(([key]) => key)
     .filter((key) => key !== "backup.restore" && key !== "audit.view"),
   "Cashier": ["subscriber.view", "payment.create"],
-  "Collection Supervisor": ["subscriber.view", "collection.reconcile", "report.view", "report.export"],
+  "Collection Supervisor": ["subscriber.view", "collection.manage", "collection.reconcile", "report.view", "report.export"],
   "Accounting / Auditor": ["subscriber.view", "payment.reverse", "report.view", "report.export", "audit.view"],
   "Technician": ["subscriber.view", "service.view", "service.update"],
   "Read-only Viewer": ["subscriber.view", "report.view"],
@@ -50,11 +47,17 @@ const roleGrants: Record<string, readonly string[]> = {
 
 const client = await pool.connect();
 try {
-  const passwordHash = await hashPassword(password);
   await client.query("BEGIN");
   const count = await client.query<{ count: string }>("SELECT count(*)::text AS count FROM users");
-  if (count.rows[0]?.count !== "0") {
-    throw new Error("Admin bootstrap is allowed only before the first user has been created.");
+  const bootstrapRequired = count.rows[0]?.count === "0";
+
+  if (bootstrapRequired) {
+    if (!usernameInput || usernameInput.length < 3 || usernameInput.length > 64 || !/^[a-z0-9._-]+$/.test(usernameInput)) {
+      throw new Error("Set BCIS_INITIAL_ADMIN_USERNAME to 3-64 lowercase letters, numbers, dots, underscores, or hyphens.");
+    }
+    if (!passwordInput || passwordInput.length < 12 || passwordInput.length > 128) {
+      throw new Error("Set BCIS_INITIAL_ADMIN_PASSWORD to a password between 12 and 128 characters.");
+    }
   }
 
   for (const [key, description] of permissionDefinitions) {
@@ -89,19 +92,25 @@ try {
     ["Owner / Super Admin"],
   );
 
-  const user = await client.query<{ id: string }>(
-    `INSERT INTO users (username, display_name, password_hash)
-     VALUES ($1, 'BCIS Owner', $2)
-     RETURNING id`,
-    [username, passwordHash],
-  );
-  await client.query(
-    `INSERT INTO user_roles (user_id, role_id)
-     SELECT $1, id FROM roles WHERE name = $2`,
-    [user.rows[0]!.id, "Owner / Super Admin"],
-  );
-  await client.query("COMMIT");
-  console.info(`Initial administrator "${username}" created. Remove the bootstrap credentials from the environment.`);
+  if (bootstrapRequired) {
+    const passwordHash = await hashPassword(passwordInput!);
+    const user = await client.query<{ id: string }>(
+      `INSERT INTO users (username, display_name, password_hash)
+       VALUES ($1, 'BCIS Owner', $2)
+       RETURNING id`,
+      [usernameInput, passwordHash],
+    );
+    await client.query(
+      `INSERT INTO user_roles (user_id, role_id)
+       SELECT $1, id FROM roles WHERE name = $2`,
+      [user.rows[0]!.id, "Owner / Super Admin"],
+    );
+    await client.query("COMMIT");
+    console.info(`Initial administrator "${usernameInput}" created. Remove the bootstrap credentials from the environment.`);
+  } else {
+    await client.query("COMMIT");
+    console.info("Users already exist: roles and permissions were synchronized; administrator bootstrap was skipped.");
+  }
 } catch (error) {
   await client.query("ROLLBACK");
   throw error;
