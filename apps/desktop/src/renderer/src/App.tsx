@@ -1,24 +1,24 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import type {
   AuthUser,
-  CollectionArea,
-  CreateCollectionAreaInput,
-  CreatePlanInput,
-  CreateServiceAccountInput,
-  CreateSubscriberInput,
+
+
+
+
+
   DesktopApiHealth,
   ManagedUser,
-  ServiceAccountDetail,
-  ServiceAccountListResponse,
-  ServiceAccountStatus,
-  ServicePlan,
-  SubscriberDetail,
-  SubscriberListResponse,
-  SubscriberStatus,
-  UpdatePlanInput,
-  UpdateServiceAccountInput,
-  UpdateSubscriberInput,
+
+
+
+
+
+
+
+
+
+
 } from "@bcis/shared";
 
 const navigation = [
@@ -32,20 +32,6 @@ const navigation = [
   { label: "Reports", icon: "▥", permission: "report.view" },
   { label: "Administration", icon: "⚙", permission: "user.manage" },
 ];
-
-function formatPeso(cents: number): string {
-  const value = (cents / 100).toFixed(2);
-  return `₱${value}`;
-}
-
-function formatDate(date?: string | null): string {
-  if (!date) return "—";
-  return date.slice(0, 10);
-}
-
-function toTitleCase(value: string): string {
-  return value.charAt(0).toUpperCase() + value.slice(1).toLowerCase();
-}
 
 export default function App() {
   const [apiHealth, setApiHealth] = useState<DesktopApiHealth | null>(null);
@@ -65,30 +51,6 @@ export default function App() {
   const [newRole, setNewRole] = useState("");
 
   // Phase 3 state
-  const [plans, setPlans] = useState<ServicePlan[]>([]);
-  const [areas, setAreas] = useState<CollectionArea[]>([]);
-  const [subscribers, setSubscribers] = useState<SubscriberListResponse | null>(null);
-  const [subscriberParams, setSubscriberParams] = useState<{
-    query?: string;
-    status?: SubscriberStatus;
-    collectionAreaId?: string;
-    page?: number;
-    pageSize?: number;
-  }>({ page: 1, pageSize: 20 });
-  const [selectedSubscriber, setSelectedSubscriber] = useState<SubscriberDetail | null>(null);
-  const [serviceAccounts, setServiceAccounts] = useState<ServiceAccountListResponse | null>(null);
-  const [saParams, setSaParams] = useState<{
-    query?: string;
-    status?: ServiceAccountStatus;
-    page?: number;
-    pageSize?: number;
-  }>({ page: 1, pageSize: 20 });
-  const [selectedServiceAccount, setSelectedServiceAccount] = useState<ServiceAccountDetail | null>(null);
-  const [plansLoading, setPlansLoading] = useState(false);
-  const [areasLoading, setAreasLoading] = useState(false);
-  const [subsLoading, setSubsLoading] = useState(false);
-  const [saLoading, setSaLoading] = useState(false);
-  const [detailLoading, setDetailLoading] = useState(false);
 
 
   useEffect(() => {
