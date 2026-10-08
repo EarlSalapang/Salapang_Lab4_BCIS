@@ -1,3 +1,4 @@
+export const isoDateTimeSchema = z.string().datetime({ offset: true }).min(1);
 import { z } from "zod";
 
 export const serviceTypeSchema = z.enum(["INTERNET", "CABLE", "COMBO"]);
@@ -217,26 +218,47 @@ export const collectionAreaListSchema = z.object({ areas: z.array(collectionArea
 export const collectionAreaResponseSchema = z.object({ area: collectionAreaSchema });
 export const subscriberResponseSchema = z.object({ subscriber: subscriberDetailSchema });
 export const serviceAccountResponseSchema = z.object({ serviceAccount: serviceAccountDetailSchema });
+export const invoiceStatusEnum = z.enum(["draft", "posted", "paid", "partially_paid", "void", "overdue"]);
+export const paymentMethodEnum = z.enum(["cash", "gcash", "bank_transfer", "other"]);
 
-export type ServiceType = z.infer<typeof serviceTypeSchema>;
-export type SubscriberStatus = z.infer<typeof subscriberStatusSchema>;
-export type ServiceAccountStatus = z.infer<typeof serviceAccountStatusSchema>;
-export type ServicePlan = z.infer<typeof servicePlanSchema>;
-export type CreatePlanInput = z.infer<typeof createPlanInputSchema>;
-export type UpdatePlanInput = z.infer<typeof updatePlanInputSchema>;
-export type CollectionArea = z.infer<typeof collectionAreaSchema>;
-export type CreateCollectionAreaInput = z.infer<typeof createCollectionAreaInputSchema>;
-export type SubscriberSummary = z.infer<typeof subscriberSummarySchema>;
-export type SubscriberDetail = z.infer<typeof subscriberDetailSchema>;
-export type SubscriberAddress = z.infer<typeof subscriberAddressSchema>;
-export type CreateSubscriberInput = z.infer<typeof createSubscriberInputSchema>;
-export type UpdateSubscriberInput = z.infer<typeof updateSubscriberInputSchema>;
-export type SubscriberListQuery = z.infer<typeof subscriberListQuerySchema>;
-export type SubscriberListResponse = z.infer<typeof subscriberListSchema>;
-export type ServiceAccountSummary = z.infer<typeof serviceAccountSummarySchema>;
-export type ServiceAccountDetail = z.infer<typeof serviceAccountDetailSchema>;
-export type ServiceEvent = z.infer<typeof serviceEventSchema>;
-export type CreateServiceAccountInput = z.infer<typeof createServiceAccountInputSchema>;
-export type UpdateServiceAccountInput = z.infer<typeof updateServiceAccountInputSchema>;
-export type ServiceAccountListQuery = z.infer<typeof serviceAccountListQuerySchema>;
-export type ServiceAccountListResponse = z.infer<typeof serviceAccountListSchema>;
+export const invoiceLineItemSchema = z.object({
+  description: z.string().min(1).max(255),
+  quantity: z.number().int().min(1).default(1),
+  unitPriceCents: z.number().int().min(0),
+  amountCents: z.number().int().min(0),
+});
+
+export const invoiceSchema = z.object({
+  id: identifierSchema,
+  invoiceNumber: z.string().min(1).max(50),
+  subscriberId: identifierSchema,
+  serviceAccountId: identifierSchema.optional(),
+  billingPeriodStart: isoDateSchema,
+  billingPeriodEnd: isoDateSchema,
+  issueDate: isoDateSchema,
+  dueDate: isoDateSchema,
+  subtotalCents: z.number().int().min(0),
+  taxCents: z.number().int().min(0).default(0),
+  totalCents: z.number().int().min(0),
+  amountPaidCents: z.number().int().min(0).default(0),
+  balanceCents: z.number().int().min(0),
+  status: invoiceStatusEnum,
+  notes: z.string().max(500).nullable().optional(),
+  createdAt: isoDateTimeSchema,
+  updatedAt: isoDateTimeSchema,
+  postedAt: isoDateTimeSchema.nullable().optional(),
+});
+
+export const invoiceListSchema = z.object({ invoices: z.array(invoiceSchema), total: z.number().int().min(0), page: z.number().int().min(1), pageSize: z.number().int().min(1) });
+export const invoiceResponseSchema = z.object({ invoice: invoiceSchema });
+export const createInvoiceInputSchema = z.object({ subscriberId: identifierSchema, serviceAccountId: identifierSchema.optional(), billingPeriodStart: isoDateSchema, billingPeriodEnd: isoDateSchema, issueDate: isoDateSchema, dueDate: isoDateSchema, lineItems: z.array(invoiceLineItemSchema).min(1), notes: z.string().max(500).optional() });
+export const updateInvoiceInputSchema = z.object({ status: invoiceStatusEnum.optional(), notes: z.string().max(500).optional() }).partial();
+
+
+export type InvoiceStatus = z.infer<typeof invoiceStatusEnum>;
+export type PaymentMethod = z.infer<typeof paymentMethodEnum>;
+export type InvoiceLineItem = z.infer<typeof invoiceLineItemSchema>;
+export type Invoice = z.infer<typeof invoiceSchema>;
+export type InvoiceListResponse = z.infer<typeof invoiceListSchema>;
+export type CreateInvoiceInput = z.infer<typeof createInvoiceInputSchema>;
+export type UpdateInvoiceInput = z.infer<typeof updateInvoiceInputSchema>;
