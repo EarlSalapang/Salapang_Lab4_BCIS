@@ -9,12 +9,17 @@ import type {
   LedgerEntryListResponse,
   ManagedUser,
 } from "@bcis/shared";
+import { formatDate, formatPeso, toTitleCase } from "./lib/format";
+import PlansPage from "./pages/PlansPage";
+import SubscribersPage from "./pages/SubscribersPage";
+import ServiceAccountsPage from "./pages/ServiceAccountsPage";
 
 const navigation = [
   { label: "Dashboard", icon: "◫" },
-  { label: "Subscribers", icon: "⌂" },
-  { label: "Service Accounts", icon: "⌁" },
-  { label: "Billing", icon: "▤" },
+  { label: "Subscribers", icon: "⌂", permission: "subscriber.view" },
+  { label: "Service Accounts", icon: "⌁", permission: "subscriber.view" },
+  { label: "Plans & Areas", icon: "▦", permission: "plan.manage" },
+  { label: "Billing", icon: "▤", permission: "subscriber.view" },
   { label: "Payments", icon: "₱" },
   { label: "Collections", icon: "⇄" },
   { label: "Receivables", icon: "◷" },
@@ -22,20 +27,9 @@ const navigation = [
   { label: "Administration", icon: "⚙", permission: "user.manage" },
 ];
 
-const implementedPages = new Set(["Dashboard", "Administration", "Billing"]);
+const implementedPages = ["Billing", "Plans & Areas", "Subscribers", "Service Accounts", "Administration"];
+
 const invoiceStatuses: InvoiceStatus[] = ["draft", "posted", "partially_paid", "paid", "overdue", "void"];
-
-function formatPeso(cents: number): string {
-  return `₱${(cents / 100).toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function formatDate(value?: string | null): string {
-  return value ? value.slice(0, 10) : "—";
-}
-
-function toTitleCase(value: string): string {
-  return value.replace(/_/g, " ").replace(/\b\w/g, (character) => character.toUpperCase());
-}
 
 function isoDate(offsetDays = 0): string {
   return new Date(Date.now() + offsetDays * 86_400_000).toISOString().slice(0, 10);
@@ -49,7 +43,6 @@ function monthEnd(): string {
   const now = new Date();
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).toISOString().slice(0, 10);
 }
-
 export default function App() {
   const [apiHealth, setApiHealth] = useState<DesktopApiHealth | null>(null);
   const [user, setUser] = useState<AuthUser | null>(null);
@@ -399,7 +392,7 @@ setInvoices((current) =>
               className={`nav-item ${page === item.label ? "selected" : ""}`}
               onClick={() => {
                 setMessage("");
-                setPage(implementedPages.has(item.label) ? item.label : "Dashboard");
+                setPage(implementedPages.includes(item.label) ? item.label : "Dashboard");
               }}
             >
               <span className="nav-icon">{item.icon}</span>
@@ -436,7 +429,13 @@ setInvoices((current) =>
 
         {message && <p className="success-alert" role="status">{message}</p>}
 
-        {page === "Billing" ? (
+        {page === "Subscribers" ? (
+          <SubscribersPage permissions={user.permissions} onMessage={setMessage} />
+        ) : page === "Service Accounts" ? (
+          <ServiceAccountsPage permissions={user.permissions} onMessage={setMessage} />
+        ) : page === "Plans & Areas" ? (
+          <PlansPage onMessage={setMessage} />
+        ) : page === "Billing" ? (
           <section className="content-section" aria-labelledby="billing-title">
             <div className="section-heading">
               <div>
