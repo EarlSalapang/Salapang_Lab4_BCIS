@@ -1,8 +1,15 @@
+import { randomUUID } from "node:crypto";
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
+
 import type { Pool, PoolClient, QueryResultRow } from "pg";
 import type {
+  AllocationPreview,
+  AllocationPreviewInput,
   CollectionArea,
   CreateCollectionAreaInput,
   CreateInvoiceInput,
+  CreatePaymentInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
@@ -14,6 +21,14 @@ import type {
   LedgerEntry,
   LedgerEntryListQuery,
   LedgerEntryListResponse,
+  Payment,
+  PaymentAllocation,
+  PaymentListQuery,
+  PaymentListResponse,
+  PaymentProof,
+  PaymentProofInput,
+  PaymentReversal,
+  ReversePaymentInput,
   ServiceAccountDetail,
   ServiceAccountListQuery,
   ServiceAccountListResponse,
@@ -29,12 +44,14 @@ import type {
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
+  VerifyPaymentInput,
 } from "@bcis/shared";
 
 import { conflict, invalidRequest, notFound, type BillingGenerationResult, type DirectoryActor, type DirectoryStore } from "./types.js";
 
 const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
+const uploadsRoot = process.env.BCIS_UPLOAD_DIR ?? path.resolve(process.cwd(), "uploads");
 
 interface PlanRow extends QueryResultRow {
   id: string;
@@ -345,6 +362,140 @@ function mapAreaWriteError(error: unknown): never {
   if (isUniqueViolation(error)) throw conflict("A collection area with that code already exists.");
   throw error;
 }
+
+interface PaymentRow extends QueryResultRow {
+  id: string;
+  receipt_number: string;
+  subscriber_id: string;
+  amount_cents: number;
+  method: string;
+  reference_number: string | null;
+  notes: string | null;
+  status: string;
+  verification_note: string | null;
+  payment_date: Date;
+  verified_at: Date | null;
+  verified_by_user_id: string | null;
+  created_by_user_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+  subscriber_account_number: string;
+  subscriber_name: string;
+  allocated_cents: string;
+}
+
+interface PaymentAllocationRow extends QueryResultRow {
+  id: string;
+  payment_id: string;
+  invoice_id: string;
+  amount_cents: number;
+  created_at: Date;
+  invoice_number: string;
+}
+
+interface PaymentProofRow extends QueryResultRow {
+  id: string;
+  payment_id: string;
+  file_name: string;
+  content_type: string;
+  size_bytes: number;
+  storage_path: string;
+  uploaded_by_user_id: string | null;
+  created_at: Date;
+}
+
+interface PaymentReversalRow extends QueryResultRow {
+  id: string;
+  payment_id: string;
+  reason: string;
+  reversed_by_user_id: string | null;
+  created_at: Date;
+}
+
+interface AllocatableInvoiceRow extends QueryResultRow {
+  id: string;
+  invoice_number: string;
+  issue_date: string;
+  due_date: string;
+  total_cents: number;
+  amount_paid_cents: number;
+  balance_cents: number;
+  status: string;
+}
+
+function toPaymentAllocation(row: PaymentAllocationRow): PaymentAllocation {
+  return {
+    id: row.id,
+    invoiceId: row.invoice_id,
+    invoiceNumber: row.invoice_number,
+    amountCents: row.amount_cents,
+    createdAt: row.created_at.toISOString(),
+  };
+}
+
+function toPaymentProof(row: PaymentProofRow): PaymentProof {
+  return {
+    id: row.id,
+    fileName: row.file_name,
+    contentType: row.content_type,
+    sizeBytes: row.size_bytes,
+    storagePath: row.storage_path,
+    uploadedByUserId: row.uploaded_by_user_id,
+    createdAt: row.created_at.toISOString(),
+  };
+}
+
+function toPaymentReversal(row: PaymentReversalRow): PaymentReversal {
+  return {
+    id: row.id,
+    reason: row.reason,
+    reversedByUserId: row.reversed_by_user_id,
+    createdAt: row.created_at.toISOString(),
+  };
+}
+
+function toPayment(
+  row: PaymentRow,
+  allocations: PaymentAllocation[] | undefined,
+  proofs: PaymentProof[] | undefined,
+  reversal: PaymentReversal | null | undefined,
+): Payment {
+  const allocatedCents = allocations
+    ? allocations.reduce((sum, allocation) => sum + allocation.amountCents, 0)
+    : Number(row.allocated_cents ?? 0);
+  const amountCents = row.amount_cents;
+  return {
+    id: row.id,
+    receiptNumber: row.receipt_number,
+    subscriberId: row.subscriber_id,
+    subscriberAccountNumber: row.subscriber_account_number,
+    subscriberName: row.subscriber_name,
+    amountCents,
+    allocatedCents,
+    unallocatedCents: Math.max(amountCents - allocatedCents, 0),
+    method: row.method as Payment["method"],
+    referenceNumber: row.reference_number,
+    notes: row.notes,
+    status: row.status as Payment["status"],
+    verificationNote: row.verification_note,
+    paymentDate: row.payment_date.toISOString(),
+    verifiedAt: row.verified_at ? row.verified_at.toISOString() : null,
+    verifiedByUserId: row.verified_by_user_id,
+    createdByUserId: row.created_by_user_id,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+    allocations,
+    proofs,
+    reversal: reversal ?? null,
+  };
+}
+
+const PAYMENT_SELECT = `
+  SELECT p.*, s.account_number AS subscriber_account_number,
+         trim(concat_ws(' ', s.first_name, s.middle_name, s.last_name)) AS subscriber_name,
+         COALESCE((SELECT SUM(pa.amount_cents) FROM payment_allocations pa WHERE pa.payment_id = p.id), 0)::text AS allocated_cents
+  FROM payments p
+  JOIN subscribers s ON s.id = p.subscriber_id`;
 
 export class PostgresDirectoryStore implements DirectoryStore {
   constructor(private readonly pool: Pool) {}
@@ -1122,6 +1273,273 @@ export class PostgresDirectoryStore implements DirectoryStore {
     };
   }
 
+  async previewAllocation(input: AllocationPreviewInput): Promise<AllocationPreview> {
+    const result = await this.pool.query<AllocatableInvoiceRow>(
+      `SELECT id, invoice_number, issue_date, due_date, total_cents, amount_paid_cents, balance_cents, status
+       FROM invoices
+       WHERE subscriber_id = $1 AND status IN ('posted', 'partially_paid', 'overdue') AND balance_cents > 0
+       ORDER BY due_date ASC, issue_date ASC, created_at ASC`,
+      [input.subscriberId],
+    );
+    return buildAllocationPreview(input.subscriberId, input.amountCents, result.rows);
+  }
+
+  async listPayments(query: PaymentListQuery): Promise<PaymentListResponse> {
+    const filters: string[] = [];
+    const values: unknown[] = [];
+    if (query.subscriberId) {
+      values.push(query.subscriberId);
+      filters.push(`p.subscriber_id = $${values.length}`);
+    }
+    if (query.status) {
+      values.push(query.status);
+      filters.push(`p.status = $${values.length}`);
+    }
+    if (query.method) {
+      values.push(query.method);
+      filters.push(`p.method = $${values.length}`);
+    }
+    if (query.from) {
+      values.push(query.from);
+      filters.push(`p.payment_date >= $${values.length}`);
+    }
+    if (query.to) {
+      values.push(`${query.to}T23:59:59.999Z`);
+      filters.push(`p.payment_date <= $${values.length}`);
+    }
+    if (query.query) {
+      values.push(`%${query.query.toLowerCase()}%`);
+      filters.push(
+        `(lower(p.receipt_number) LIKE $${values.length} OR lower(s.account_number) LIKE $${values.length}
+          OR lower(concat_ws(' ', s.first_name, s.middle_name, s.last_name)) LIKE $${values.length}
+          OR lower(coalesce(p.reference_number, '')) LIKE $${values.length})`,
+      );
+    }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const countResult = await this.pool.query<{ total: string }>(
+      `SELECT count(*)::text AS total FROM payments p JOIN subscribers s ON s.id = p.subscriber_id ${where}`,
+      values,
+    );
+    const offset = (query.page - 1) * query.pageSize;
+    const result = await this.pool.query<PaymentRow>(
+      `${PAYMENT_SELECT} ${where}
+       ORDER BY p.payment_date DESC, p.created_at DESC
+       LIMIT ${query.pageSize} OFFSET ${offset}`,
+      values,
+    );
+    return {
+      payments: result.rows.map((row) => toPayment(row, undefined, undefined, undefined)),
+      total: Number(countResult.rows[0]?.total ?? 0),
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
+  async getPayment(id: string): Promise<Payment | null> {
+    const result = await this.pool.query<PaymentRow>(`${PAYMENT_SELECT} WHERE p.id = $1`, [id]);
+    const row = result.rows[0];
+    if (!row) return null;
+    const [allocations, proofs, reversal] = await Promise.all([
+      this.pool.query<PaymentAllocationRow>(
+        `SELECT pa.*, i.invoice_number FROM payment_allocations pa
+         JOIN invoices i ON i.id = pa.invoice_id
+         WHERE pa.payment_id = $1 ORDER BY i.due_date ASC, pa.created_at ASC`,
+        [id],
+      ),
+      this.pool.query<PaymentProofRow>(`SELECT * FROM payment_proofs WHERE payment_id = $1 ORDER BY created_at ASC`, [id]),
+      this.pool.query<PaymentReversalRow>(`SELECT * FROM payment_reversals WHERE payment_id = $1`, [id]),
+    ]);
+    return toPayment(
+      row,
+      allocations.rows.map(toPaymentAllocation),
+      proofs.rows.map(toPaymentProof),
+      reversal.rows[0] ? toPaymentReversal(reversal.rows[0]) : null,
+    );
+  }
+
+  async createPayment(input: CreatePaymentInput, actor: DirectoryActor): Promise<Payment> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await requireSubscriberExists(client, input.subscriberId);
+      if (input.method === "gcash" && input.referenceNumber) {
+        await assertUniqueGcashReference(client, input.referenceNumber, null);
+      }
+      const receiptNumber = await nextNumber(client, "receipt", "RCPT-");
+      const status = input.method === "gcash" ? "pending" : "posted";
+      const paymentDate = input.paymentDate ? new Date(input.paymentDate).toISOString() : new Date().toISOString();
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO payments
+           (receipt_number, subscriber_id, amount_cents, method, reference_number, notes, status, payment_date, created_by_user_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         RETURNING id`,
+        [
+          receiptNumber,
+          input.subscriberId,
+          input.amountCents,
+          input.method,
+          input.referenceNumber ?? null,
+          input.notes ?? null,
+          status,
+          paymentDate,
+          actor.userId,
+        ],
+      );
+      const paymentId = inserted.rows[0]!.id;
+      for (const proof of input.proofs ?? []) {
+        await this.insertPaymentProof(client, paymentId, proof, actor);
+      }
+      if (status === "posted") {
+        await allocatePayment(client, {
+          paymentId,
+          subscriberId: input.subscriberId,
+          amountCents: input.amountCents,
+          receiptNumber,
+          entryDate: paymentDate.slice(0, 10),
+        }, actor);
+      }
+      await client.query("COMMIT");
+      const payment = await this.getPayment(paymentId);
+      if (!payment) throw notFound("Payment");
+      return payment;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async verifyPayment(id: string, input: VerifyPaymentInput, actor: DirectoryActor): Promise<Payment> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<PaymentRow>(`${PAYMENT_SELECT} WHERE p.id = $1 FOR UPDATE`, [id]);
+      const row = result.rows[0];
+      if (!row) throw notFound("Payment");
+      if (row.method !== "gcash") throw invalidRequest("Only GCash payments require verification.");
+      if (row.status !== "pending") throw conflict("Only pending GCash payments can be verified or rejected.");
+      const note = input.note ?? null;
+      if (input.decision === "reject") {
+        await client.query(
+          `UPDATE payments SET status = 'rejected', verification_note = $2, verified_at = now(),
+             verified_by_user_id = $3, updated_at = now() WHERE id = $1`,
+          [id, note, actor.userId],
+        );
+      } else {
+        if (row.reference_number) {
+          await assertUniqueGcashReference(client, row.reference_number, id);
+        }
+        await allocatePayment(client, {
+          paymentId: id,
+          subscriberId: row.subscriber_id,
+          amountCents: row.amount_cents,
+          receiptNumber: row.receipt_number,
+          entryDate: row.payment_date.toISOString().slice(0, 10),
+        }, actor);
+        await client.query(
+          `UPDATE payments SET status = 'posted', verification_note = $2, verified_at = now(),
+             verified_by_user_id = $3, updated_at = now() WHERE id = $1`,
+          [id, note, actor.userId],
+        );
+      }
+      await client.query("COMMIT");
+      const payment = await this.getPayment(id);
+      if (!payment) throw notFound("Payment");
+      return payment;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async reversePayment(id: string, input: ReversePaymentInput, actor: DirectoryActor): Promise<Payment> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await client.query<PaymentRow>(`${PAYMENT_SELECT} WHERE p.id = $1 FOR UPDATE`, [id]);
+      const row = result.rows[0];
+      if (!row) throw notFound("Payment");
+      if (row.status !== "posted") throw conflict("Only posted payments can be reversed.");
+      const allocations = await client.query<PaymentAllocationRow>(
+        `SELECT pa.*, i.invoice_number FROM payment_allocations pa
+         JOIN invoices i ON i.id = pa.invoice_id
+         WHERE pa.payment_id = $1 ORDER BY pa.created_at ASC`,
+        [id],
+      );
+      for (const allocation of allocations.rows) {
+        const invoiceResult = await client.query<AllocatableInvoiceRow>(
+          `SELECT id, invoice_number, issue_date, due_date, total_cents, amount_paid_cents, balance_cents, status
+           FROM invoices WHERE id = $1 FOR UPDATE`,
+          [allocation.invoice_id],
+        );
+        const invoice = invoiceResult.rows[0];
+        if (!invoice || invoice.status === "void") continue;
+        const amountPaid = Math.max(invoice.amount_paid_cents - allocation.amount_cents, 0);
+        const balance = invoice.balance_cents + allocation.amount_cents;
+        const status = amountPaid === 0 ? "posted" : balance === 0 ? "paid" : "partially_paid";
+        await client.query(
+          `UPDATE invoices SET amount_paid_cents = $2, balance_cents = $3, status = $4, updated_at = now() WHERE id = $1`,
+          [invoice.id, amountPaid, balance, status],
+        );
+      }
+      await client.query(`DELETE FROM payment_allocations WHERE payment_id = $1`, [id]);
+      await postSubscriberLedgerEntry(
+        client,
+        { subscriberId: row.subscriber_id, entryDate: new Date().toISOString().slice(0, 10) },
+        actor,
+        "debit",
+        "reversal",
+        row.amount_cents,
+        `Payment reversed ${row.receipt_number}: ${input.reason}`,
+      );
+      await client.query(
+        `UPDATE payments SET status = 'reversed', updated_at = now() WHERE id = $1`,
+        [id],
+      );
+      await client.query(
+        `INSERT INTO payment_reversals (payment_id, reason, reversed_by_user_id) VALUES ($1, $2, $3)`,
+        [id, input.reason, actor.userId],
+      );
+      await client.query("COMMIT");
+      const payment = await this.getPayment(id);
+      if (!payment) throw notFound("Payment");
+      return payment;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async insertPaymentProof(
+    client: PoolClient,
+    paymentId: string,
+    proof: PaymentProofInput,
+    actor: DirectoryActor,
+  ): Promise<void> {
+    const allowed = new Set(["image/png", "image/jpeg", "image/webp", "application/pdf"]);
+    if (!allowed.has(proof.contentType)) {
+      throw invalidRequest("Payment proofs must be a PNG, JPEG, WEBP, or PDF file.");
+    }
+    const bytes = Buffer.from(proof.contentBase64, "base64");
+    if (bytes.byteLength === 0) throw invalidRequest("The payment proof file is empty.");
+    if (bytes.byteLength > 5 * 1024 * 1024) throw invalidRequest("Payment proofs cannot exceed 5 MB.");
+    const safeName = proof.fileName.replace(/[^A-Za-z0-9._-]/g, "_").slice(-120) || "proof";
+    const storagePath = `payments/${paymentId}/${randomUUID()}-${safeName}`;
+    const absolutePath = path.join(uploadsRoot, storagePath);
+    await mkdir(path.dirname(absolutePath), { recursive: true });
+    await writeFile(absolutePath, bytes);
+    await client.query(
+      `INSERT INTO payment_proofs (payment_id, file_name, content_type, size_bytes, storage_path, uploaded_by_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [paymentId, proof.fileName, proof.contentType, bytes.byteLength, storagePath, actor.userId],
+    );
+  }
+
   private async requireSubscriber(id: string): Promise<SubscriberDetail> {
     const subscriber = await this.getSubscriber(id);
     if (!subscriber) throw notFound("Subscriber");
@@ -1255,4 +1673,135 @@ async function postLedgerEntry(
       actor.userId,
     ],
   );
+}
+
+interface AllocateContext {
+  paymentId: string;
+  subscriberId: string;
+  amountCents: number;
+  receiptNumber: string;
+  entryDate: string;
+}
+
+async function allocatePayment(
+  client: PoolClient,
+  context: AllocateContext,
+  actor: DirectoryActor,
+): Promise<void> {
+  const result = await client.query<AllocatableInvoiceRow>(
+    `SELECT id, invoice_number, issue_date, due_date, total_cents, amount_paid_cents, balance_cents, status
+     FROM invoices
+     WHERE subscriber_id = $1 AND status IN ('posted', 'partially_paid', 'overdue') AND balance_cents > 0
+     ORDER BY due_date ASC, issue_date ASC, created_at ASC
+     FOR UPDATE`,
+    [context.subscriberId],
+  );
+  let remaining = context.amountCents;
+  for (const invoice of result.rows) {
+    if (remaining <= 0) break;
+    const allocation = Math.min(remaining, invoice.balance_cents);
+    if (allocation <= 0) continue;
+    await client.query(
+      `INSERT INTO payment_allocations (payment_id, invoice_id, amount_cents) VALUES ($1, $2, $3)`,
+      [context.paymentId, invoice.id, allocation],
+    );
+    const amountPaid = invoice.amount_paid_cents + allocation;
+    const balance = invoice.balance_cents - allocation;
+    const status = balance === 0 ? "paid" : "partially_paid";
+    await client.query(
+      `UPDATE invoices SET amount_paid_cents = $2, balance_cents = $3, status = $4, updated_at = now() WHERE id = $1`,
+      [invoice.id, amountPaid, balance, status],
+    );
+    remaining -= allocation;
+  }
+  await postSubscriberLedgerEntry(
+    client,
+    { subscriberId: context.subscriberId, entryDate: context.entryDate },
+    actor,
+    "credit",
+    "payment",
+    context.amountCents,
+    `Payment ${context.receiptNumber}`,
+  );
+}
+
+async function postSubscriberLedgerEntry(
+  client: PoolClient,
+  context: { subscriberId: string; entryDate: string },
+  actor: DirectoryActor,
+  entryType: "debit" | "credit",
+  sourceType: "payment" | "reversal",
+  amountCents: number,
+  description: string,
+): Promise<void> {
+  const balanceResult = await client.query<{ balance: string }>(
+    `SELECT COALESCE(SUM(CASE WHEN entry_type = 'debit' THEN amount_cents ELSE -amount_cents END), 0)::text AS balance
+     FROM ledger_entries WHERE subscriber_id = $1`,
+    [context.subscriberId],
+  );
+  const previous = Number(balanceResult.rows[0]?.balance ?? 0);
+  const delta = entryType === "debit" ? amountCents : -amountCents;
+  await client.query(
+    `INSERT INTO ledger_entries
+       (subscriber_id, service_account_id, invoice_id, entry_date, entry_type, source_type, amount_cents, balance_cents, description, created_by_user_id)
+     VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)`,
+    [
+      context.subscriberId,
+      context.entryDate,
+      entryType,
+      sourceType,
+      amountCents,
+      previous + delta,
+      description,
+      actor.userId,
+    ],
+  );
+}
+
+async function assertUniqueGcashReference(
+  client: PoolClient,
+  referenceNumber: string,
+  excludePaymentId: string | null,
+): Promise<void> {
+  const result = await client.query<{ id: string }>(
+    `SELECT id FROM payments
+     WHERE method = 'gcash' AND reference_number = $1
+       AND status NOT IN ('rejected', 'reversed')
+       AND ($2::uuid IS NULL OR id <> $2::uuid)
+     LIMIT 1`,
+    [referenceNumber, excludePaymentId],
+  );
+  if (result.rowCount) {
+    throw conflict("A GCash payment with that reference number has already been recorded.");
+  }
+}
+
+function buildAllocationPreview(
+  subscriberId: string,
+  amountCents: number,
+  invoices: AllocatableInvoiceRow[],
+): AllocationPreview {
+  let remaining = amountCents;
+  const allocations: AllocationPreview["allocations"] = [];
+  for (const invoice of invoices) {
+    if (remaining <= 0) break;
+    const allocation = Math.min(remaining, invoice.balance_cents);
+    if (allocation <= 0) continue;
+    allocations.push({
+      invoiceId: invoice.id,
+      invoiceNumber: invoice.invoice_number,
+      issueDate: invoice.issue_date,
+      dueDate: invoice.due_date,
+      balanceCents: invoice.balance_cents,
+      amountCents: allocation,
+    });
+    remaining -= allocation;
+  }
+  return {
+    subscriberId,
+    amountCents,
+    allocatedCents: amountCents - remaining,
+    unallocatedCents: remaining,
+    allocations,
+  };
 }

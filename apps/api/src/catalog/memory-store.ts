@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type {
+  AllocationPreview,
+  AllocationPreviewInput,
   CollectionArea,
   CreateCollectionAreaInput,
   CreateInvoiceInput,
+  CreatePaymentInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
@@ -14,6 +17,10 @@ import type {
   LedgerEntry,
   LedgerEntryListQuery,
   LedgerEntryListResponse,
+  Payment,
+  PaymentListQuery,
+  PaymentListResponse,
+  ReversePaymentInput,
   ServiceAccountDetail,
   ServiceAccountListQuery,
   ServiceAccountListResponse,
@@ -27,6 +34,7 @@ import type {
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
+  VerifyPaymentInput,
 } from "@bcis/shared";
 
 import type { AuthStore } from "../auth/types.js";
@@ -40,6 +48,7 @@ export class MemoryDirectoryStore implements DirectoryStore {
   private readonly counters = new Map<string, number>();
   private readonly invoices = new Map<string, Invoice>();
   private readonly ledgerEntries: LedgerEntry[] = [];
+  private readonly payments = new Map<string, Payment>();
 
   private nextNumber(name: string, prefix: string): string {
     const value = (this.counters.get(name) ?? 0) + 1;
@@ -505,6 +514,265 @@ export class MemoryDirectoryStore implements DirectoryStore {
       page: query.page,
       pageSize: query.pageSize,
     };
+  }
+
+  async previewAllocation(input: AllocationPreviewInput): Promise<AllocationPreview> {
+    return this.buildAllocationPreview(input.subscriberId, input.amountCents);
+  }
+
+  async listPayments(query: PaymentListQuery): Promise<PaymentListResponse> {
+    const needle = query.query?.toLowerCase();
+    const matches = [...this.payments.values()]
+      .filter((payment) => {
+        if (query.subscriberId && payment.subscriberId !== query.subscriberId) return false;
+        if (query.status && payment.status !== query.status) return false;
+        if (query.method && payment.method !== query.method) return false;
+        if (query.from && payment.paymentDate < query.from) return false;
+        if (query.to && payment.paymentDate > `${query.to}T23:59:59.999Z`) return false;
+        if (!needle) return true;
+        return [
+          payment.receiptNumber,
+          payment.subscriberAccountNumber,
+          payment.subscriberName,
+          payment.referenceNumber ?? "",
+        ].some((value) => value.toLowerCase().includes(needle));
+      })
+      .sort((left, right) => right.paymentDate.localeCompare(left.paymentDate) || right.createdAt.localeCompare(left.createdAt));
+    const start = (query.page - 1) * query.pageSize;
+    return {
+      payments: matches.slice(start, start + query.pageSize).map(({ allocations: _a, proofs: _p, reversal: _r, ...rest }) => structuredClone(rest)),
+      total: matches.length,
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
+  async getPayment(id: string): Promise<Payment | null> {
+    const payment = this.payments.get(id);
+    return payment ? structuredClone(payment) : null;
+  }
+
+  async createPayment(input: CreatePaymentInput, actor: DirectoryActor): Promise<Payment> {
+    const subscriber = this.subscribers.get(input.subscriberId);
+    if (!subscriber) throw notFound("Subscriber");
+    if (input.method === "gcash" && input.referenceNumber) {
+      this.assertUniqueGcashReference(input.referenceNumber, null);
+    }
+    const now = this.now();
+    const id = randomUUID();
+    const status = input.method === "gcash" ? "pending" : "posted";
+    const payment: Payment = {
+      id,
+      receiptNumber: this.nextNumber("receipt", "RCPT-"),
+      subscriberId: input.subscriberId,
+      subscriberAccountNumber: subscriber.accountNumber,
+      subscriberName: subscriber.displayName,
+      amountCents: input.amountCents,
+      allocatedCents: 0,
+      unallocatedCents: input.amountCents,
+      method: input.method,
+      referenceNumber: input.referenceNumber ?? null,
+      notes: input.notes ?? null,
+      status,
+      verificationNote: null,
+      paymentDate: input.paymentDate ?? now,
+      verifiedAt: null,
+      verifiedByUserId: null,
+      createdByUserId: actor.userId,
+      createdAt: now,
+      updatedAt: now,
+      allocations: [],
+      proofs: (input.proofs ?? []).map((proof) => ({
+        id: randomUUID(),
+        fileName: proof.fileName,
+        contentType: proof.contentType,
+        sizeBytes: proof.sizeBytes,
+        storagePath: `payments/${id}/${proof.fileName}`,
+        uploadedByUserId: actor.userId,
+        createdAt: now,
+      })),
+      reversal: null,
+    };
+    this.payments.set(payment.id, payment);
+    if (payment.status === "posted") {
+      this.allocatePaymentRecord(payment, actor);
+    }
+    return structuredClone(payment);
+  }
+
+  async verifyPayment(id: string, input: VerifyPaymentInput, actor: DirectoryActor): Promise<Payment> {
+    const payment = this.payments.get(id);
+    if (!payment) throw notFound("Payment");
+    if (payment.method !== "gcash") throw invalidRequest("Only GCash payments require verification.");
+    if (payment.status !== "pending") throw conflict("Only pending GCash payments can be verified or rejected.");
+    if (input.decision === "reject") {
+      payment.status = "rejected";
+    } else {
+      if (payment.referenceNumber) this.assertUniqueGcashReference(payment.referenceNumber, id);
+      payment.status = "posted";
+      this.allocatePaymentRecord(payment, actor);
+      payment.updatedAt = this.now();
+    }
+    payment.verificationNote = input.note ?? null;
+    payment.verifiedAt = this.now();
+    payment.verifiedByUserId = actor.userId;
+    payment.updatedAt = this.now();
+    return structuredClone(payment);
+  }
+
+  async reversePayment(id: string, input: ReversePaymentInput, actor: DirectoryActor): Promise<Payment> {
+    const payment = this.payments.get(id);
+    if (!payment) throw notFound("Payment");
+    if (payment.status !== "posted") throw conflict("Only posted payments can be reversed.");
+    for (const allocation of payment.allocations ?? []) {
+      const invoice = this.invoices.get(allocation.invoiceId);
+      if (!invoice || invoice.status === "void") continue;
+      invoice.amountPaidCents = Math.max(invoice.amountPaidCents - allocation.amountCents, 0);
+      invoice.balanceCents += allocation.amountCents;
+      invoice.status = invoice.amountPaidCents === 0 ? "posted" : invoice.balanceCents === 0 ? "paid" : "partially_paid";
+      invoice.updatedAt = this.now();
+    }
+    payment.allocations = [];
+    payment.allocatedCents = 0;
+    payment.unallocatedCents = payment.amountCents;
+    payment.status = "reversed";
+    payment.updatedAt = this.now();
+    payment.reversal = {
+      id: randomUUID(),
+      reason: input.reason,
+      reversedByUserId: actor.userId,
+      createdAt: this.now(),
+    };
+    this.postSubscriberLedger(
+      payment.subscriberId,
+      actor,
+      "debit",
+      "reversal",
+      payment.amountCents,
+      `Payment reversed ${payment.receiptNumber}: ${input.reason}`,
+      this.now().slice(0, 10),
+    );
+    return structuredClone(payment);
+  }
+
+  private allocatePaymentRecord(payment: Payment, actor: DirectoryActor): void {
+    const targets = [...this.invoices.values()]
+      .filter((invoice) =>
+        invoice.subscriberId === payment.subscriberId
+        && ["posted", "partially_paid", "overdue"].includes(invoice.status)
+        && invoice.balanceCents > 0,
+      )
+      .sort((left, right) =>
+        left.dueDate.localeCompare(right.dueDate)
+        || left.issueDate.localeCompare(right.issueDate)
+        || left.createdAt.localeCompare(right.createdAt),
+      );
+    let remaining = payment.amountCents;
+    payment.allocations = [];
+    for (const invoice of targets) {
+      if (remaining <= 0) break;
+      const allocation = Math.min(remaining, invoice.balanceCents);
+      if (allocation <= 0) continue;
+      invoice.amountPaidCents += allocation;
+      invoice.balanceCents -= allocation;
+      invoice.status = invoice.balanceCents === 0 ? "paid" : "partially_paid";
+      invoice.updatedAt = this.now();
+      payment.allocations.push({
+        id: randomUUID(),
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        amountCents: allocation,
+        createdAt: this.now(),
+      });
+      remaining -= allocation;
+    }
+    payment.allocatedCents = payment.amountCents - remaining;
+    payment.unallocatedCents = remaining;
+    this.postSubscriberLedger(
+      payment.subscriberId,
+      actor,
+      "credit",
+      "payment",
+      payment.amountCents,
+      `Payment ${payment.receiptNumber}`,
+      payment.paymentDate.slice(0, 10),
+    );
+  }
+
+  private buildAllocationPreview(subscriberId: string, amountCents: number): AllocationPreview {
+    const targets = [...this.invoices.values()]
+      .filter((invoice) =>
+        invoice.subscriberId === subscriberId
+        && ["posted", "partially_paid", "overdue"].includes(invoice.status)
+        && invoice.balanceCents > 0,
+      )
+      .sort((left, right) =>
+        left.dueDate.localeCompare(right.dueDate)
+        || left.issueDate.localeCompare(right.issueDate)
+        || left.createdAt.localeCompare(right.createdAt),
+      );
+    let remaining = amountCents;
+    const allocations: AllocationPreview["allocations"] = [];
+    for (const invoice of targets) {
+      if (remaining <= 0) break;
+      const allocation = Math.min(remaining, invoice.balanceCents);
+      if (allocation <= 0) continue;
+      allocations.push({
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        dueDate: invoice.dueDate,
+        issueDate: invoice.issueDate,
+        balanceCents: invoice.balanceCents,
+        amountCents: allocation,
+      });
+      remaining -= allocation;
+    }
+    return {
+      subscriberId,
+      amountCents,
+      allocatedCents: amountCents - remaining,
+      unallocatedCents: remaining,
+      allocations,
+    };
+  }
+
+  private assertUniqueGcashReference(referenceNumber: string, excludeId: string | null): void {
+    const duplicate = [...this.payments.values()].some((payment) =>
+      payment.method === "gcash"
+      && payment.referenceNumber === referenceNumber
+      && !["rejected", "reversed"].includes(payment.status)
+      && payment.id !== excludeId,
+    );
+    if (duplicate) throw conflict("A GCash payment with that reference number already exists.");
+  }
+
+  private postSubscriberLedger(
+    subscriberId: string,
+    actor: DirectoryActor,
+    entryType: LedgerEntry["entryType"],
+    sourceType: LedgerEntry["sourceType"],
+    amountCents: number,
+    description: string,
+    entryDate: string,
+  ): void {
+    const previous = this.ledgerEntries
+      .filter((entry) => entry.subscriberId === subscriberId)
+      .reduce((balance, entry) => balance + (entry.entryType === "debit" ? entry.amountCents : -entry.amountCents), 0);
+    const delta = entryType === "debit" ? amountCents : -amountCents;
+    this.ledgerEntries.push({
+      id: randomUUID(),
+      subscriberId,
+      serviceAccountId: null,
+      invoiceId: null,
+      entryDate,
+      entryType,
+      sourceType,
+      amountCents,
+      balanceCents: previous + delta,
+      description,
+      createdByUserId: actor.userId,
+      createdAt: this.now(),
+    });
   }
 
   private buildInvoice(fields: {

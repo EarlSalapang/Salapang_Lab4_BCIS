@@ -1,9 +1,12 @@
 import type {
+  AllocationPreview,
+  AllocationPreviewInput,
   AuthUser,
   BillingGenerationResult,
   CollectionArea,
   CreateCollectionAreaInput,
   CreateInvoiceInput,
+  CreatePaymentInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
@@ -17,6 +20,11 @@ import type {
   InvoiceStatus,
   LedgerEntryListResponse,
   ManagedUser,
+  Payment,
+  PaymentListResponse,
+  PaymentMethod,
+  PaymentStatus,
+  ReversePaymentInput,
   ServiceAccountDetail,
   ServiceAccountListResponse,
   ServiceAccountStatus,
@@ -28,6 +36,7 @@ import type {
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
+  VerifyPaymentInput,
 } from "@bcis/shared";
 
 declare global {
@@ -98,6 +107,21 @@ declare global {
         page?: number;
         pageSize?: number;
       }) => Promise<DesktopResult<LedgerEntryListResponse>>;
+      listPayments: (params?: {
+        query?: string;
+        status?: PaymentStatus;
+        method?: PaymentMethod;
+        subscriberId?: string;
+        from?: string;
+        to?: string;
+        page?: number;
+        pageSize?: number;
+      }) => Promise<DesktopResult<PaymentListResponse>>;
+      getPayment: (id: string) => Promise<DesktopResult<{ payment: Payment }>>;
+      previewAllocation: (input: AllocationPreviewInput) => Promise<DesktopResult<AllocationPreview>>;
+      createPayment: (input: CreatePaymentInput) => Promise<DesktopResult<{ payment: Payment }>>;
+      verifyPayment: (id: string, input: VerifyPaymentInput) => Promise<DesktopResult<{ payment: Payment }>>;
+      reversePayment: (id: string, input: ReversePaymentInput) => Promise<DesktopResult<{ payment: Payment }>>;
     };
   }
 }

@@ -13,6 +13,7 @@ import { formatDate, formatPeso, toTitleCase } from "./lib/format";
 import PlansPage from "./pages/PlansPage";
 import SubscribersPage from "./pages/SubscribersPage";
 import ServiceAccountsPage from "./pages/ServiceAccountsPage";
+import PaymentsPage from "./pages/PaymentsPage";
 
 const navigation = [
   { label: "Dashboard", icon: "◫" },
@@ -20,14 +21,14 @@ const navigation = [
   { label: "Service Accounts", icon: "⌁", permission: "subscriber.view" },
   { label: "Plans & Areas", icon: "▦", permission: "plan.manage" },
   { label: "Billing", icon: "▤", permission: "subscriber.view" },
-  { label: "Payments", icon: "₱" },
+  { label: "Payments", icon: "₱", permission: "subscriber.view" },
   { label: "Collections", icon: "⇄" },
   { label: "Receivables", icon: "◷" },
   { label: "Reports", icon: "▥", permission: "report.view" },
   { label: "Administration", icon: "⚙", permission: "user.manage" },
 ];
 
-const implementedPages = ["Billing", "Plans & Areas", "Subscribers", "Service Accounts", "Administration"];
+const implementedPages = ["Billing", "Payments", "Plans & Areas", "Subscribers", "Service Accounts", "Administration"];
 
 const invoiceStatuses: InvoiceStatus[] = ["draft", "posted", "partially_paid", "paid", "overdue", "void"];
 
@@ -435,6 +436,8 @@ setInvoices((current) =>
           <ServiceAccountsPage permissions={user.permissions} onMessage={setMessage} />
         ) : page === "Plans & Areas" ? (
           <PlansPage onMessage={setMessage} />
+        ) : page === "Payments" ? (
+          <PaymentsPage permissions={user.permissions} onMessage={setMessage} />
         ) : page === "Billing" ? (
           <section className="content-section" aria-labelledby="billing-title">
             <div className="section-heading">

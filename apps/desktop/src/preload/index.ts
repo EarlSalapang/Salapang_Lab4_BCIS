@@ -1,10 +1,13 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
+  AllocationPreview,
+  AllocationPreviewInput,
   AuthUser,
   BillingGenerationResult,
   CollectionArea,
   CreateCollectionAreaInput,
   CreateInvoiceInput,
+  CreatePaymentInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
@@ -17,6 +20,10 @@ import type {
   InvoiceStatus,
   LedgerEntryListResponse,
   ManagedUser,
+  PaymentListResponse,
+  PaymentMethod,
+  PaymentStatus,
+  ReversePaymentInput,
   ServiceAccountDetail,
   ServiceAccountListResponse,
   ServiceAccountStatus,
@@ -28,6 +35,7 @@ import type {
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
+  VerifyPaymentInput,
 } from "@bcis/shared";
 
 contextBridge.exposeInMainWorld("bcis", {
@@ -119,4 +127,30 @@ contextBridge.exposeInMainWorld("bcis", {
     page?: number;
     pageSize?: number;
   }): Promise<DesktopResult<LedgerEntryListResponse>> => ipcRenderer.invoke("bcis:list-ledger", params),
+  listPayments: (params?: {
+    query?: string;
+    status?: PaymentStatus;
+    method?: PaymentMethod;
+    subscriberId?: string;
+    from?: string;
+    to?: string;
+    page?: number;
+    pageSize?: number;
+  }): Promise<DesktopResult<PaymentListResponse>> => ipcRenderer.invoke("bcis:list-payments", params),
+  getPayment: (id: string): Promise<DesktopResult<{ payment: PaymentListResponse["payments"][number] }>> =>
+    ipcRenderer.invoke("bcis:get-payment", id),
+  previewAllocation: (input: AllocationPreviewInput): Promise<DesktopResult<AllocationPreview>> =>
+    ipcRenderer.invoke("bcis:preview-allocation", input),
+  createPayment: (input: CreatePaymentInput): Promise<DesktopResult<{ payment: PaymentListResponse["payments"][number] }>> =>
+    ipcRenderer.invoke("bcis:create-payment", input),
+  verifyPayment: (
+    id: string,
+    input: VerifyPaymentInput,
+  ): Promise<DesktopResult<{ payment: PaymentListResponse["payments"][number] }>> =>
+    ipcRenderer.invoke("bcis:verify-payment", { id, input }),
+  reversePayment: (
+    id: string,
+    input: ReversePaymentInput,
+  ): Promise<DesktopResult<{ payment: PaymentListResponse["payments"][number] }>> =>
+    ipcRenderer.invoke("bcis:reverse-payment", { id, input }),
 });

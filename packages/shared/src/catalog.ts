@@ -219,7 +219,7 @@ export const collectionAreaResponseSchema = z.object({ area: collectionAreaSchem
 export const subscriberResponseSchema = z.object({ subscriber: subscriberDetailSchema });
 export const serviceAccountResponseSchema = z.object({ serviceAccount: serviceAccountDetailSchema });
 export const invoiceStatusEnum = z.enum(["draft", "posted", "paid", "partially_paid", "void", "overdue"]);
-export const paymentMethodEnum = z.enum(["cash", "gcash", "bank_transfer", "other"]);
+export const paymentMethodEnum = z.enum(["cash", "gcash", "bank_transfer", "cheque", "other"]);
 
 export const invoiceLineItemSchema = z.object({
   description: z.string().min(1).max(255),
@@ -308,6 +308,127 @@ export const billingGenerationResultSchema = z.object({
   skipped: z.number().int().min(0),
 });
 
+export const paymentStatusEnum = z.enum(["pending", "posted", "reversed", "rejected"]);
+
+export const paymentAllocationSchema = z.object({
+  id: identifierSchema,
+  invoiceId: identifierSchema,
+  invoiceNumber: z.string().min(1).max(50),
+  amountCents: z.number().int().min(0),
+  createdAt: isoDateTimeSchema,
+});
+
+export const paymentProofSchema = z.object({
+  id: identifierSchema,
+  fileName: z.string().min(1).max(255),
+  contentType: z.string().min(1).max(120),
+  sizeBytes: z.number().int().min(0),
+  storagePath: z.string().min(1).max(500),
+  uploadedByUserId: identifierSchema.nullable().optional(),
+  createdAt: isoDateTimeSchema,
+});
+
+export const paymentReversalSchema = z.object({
+  id: identifierSchema,
+  reason: z.string().min(1).max(500),
+  reversedByUserId: identifierSchema.nullable().optional(),
+  createdAt: isoDateTimeSchema,
+});
+
+export const paymentSchema = z.object({
+  id: identifierSchema,
+  receiptNumber: z.string().min(1).max(50),
+  subscriberId: identifierSchema,
+  subscriberAccountNumber: z.string().min(1).max(50),
+  subscriberName: z.string().min(1).max(255),
+  amountCents: z.number().int().min(0),
+  allocatedCents: z.number().int().min(0),
+  unallocatedCents: z.number().int().min(0),
+  method: paymentMethodEnum,
+  referenceNumber: z.string().max(120).nullable().optional(),
+  notes: z.string().max(500).nullable().optional(),
+  status: paymentStatusEnum,
+  verificationNote: z.string().max(500).nullable().optional(),
+  paymentDate: isoDateTimeSchema,
+  verifiedAt: isoDateTimeSchema.nullable().optional(),
+  verifiedByUserId: identifierSchema.nullable().optional(),
+  createdByUserId: identifierSchema.nullable().optional(),
+  createdAt: isoDateTimeSchema,
+  updatedAt: isoDateTimeSchema,
+  allocations: z.array(paymentAllocationSchema).optional(),
+  proofs: z.array(paymentProofSchema).optional(),
+  reversal: paymentReversalSchema.nullable().optional(),
+});
+
+export const paymentListQuerySchema = z.object({
+  query: optionalText(120),
+  status: paymentStatusEnum.optional(),
+  method: paymentMethodEnum.optional(),
+  subscriberId: identifierSchema.optional(),
+  from: isoDateSchema.optional(),
+  to: isoDateSchema.optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25),
+});
+
+export const paymentListSchema = z.object({
+  payments: z.array(paymentSchema),
+  total: z.number().int().min(0),
+  page: z.number().int().min(1),
+  pageSize: z.number().int().min(1),
+});
+
+export const paymentResponseSchema = z.object({ payment: paymentSchema });
+export const paymentProofResponseSchema = z.object({ proof: paymentProofSchema });
+
+export const paymentProofInputSchema = z.object({
+  fileName: z.string().min(1).max(255),
+  contentType: z.string().min(1).max(120),
+  sizeBytes: z.number().int().min(1).max(5_000_000),
+  contentBase64: z.string().min(1),
+});
+
+export const createPaymentInputSchema = z.object({
+  subscriberId: identifierSchema,
+  amountCents: z.number().int().min(1),
+  method: paymentMethodEnum,
+  referenceNumber: z.string().max(120).optional(),
+  notes: z.string().max(500).optional(),
+  paymentDate: isoDateTimeSchema.optional(),
+  proofs: z.array(paymentProofInputSchema).max(5).optional(),
+});
+
+export const verifyPaymentInputSchema = z.object({
+  decision: z.enum(["verify", "reject"]),
+  note: z.string().max(500).optional(),
+});
+
+export const reversePaymentInputSchema = z.object({
+  reason: z.string().min(5).max(500),
+});
+
+export const allocationPreviewInputSchema = z.object({
+  subscriberId: identifierSchema,
+  amountCents: z.number().int().min(1),
+});
+
+export const allocationPreviewSchema = z.object({
+  subscriberId: identifierSchema,
+  amountCents: z.number().int().min(0),
+  allocatedCents: z.number().int().min(0),
+  unallocatedCents: z.number().int().min(0),
+  allocations: z.array(
+    z.object({
+      invoiceId: identifierSchema,
+      invoiceNumber: z.string().min(1).max(50),
+      dueDate: isoDateSchema,
+      issueDate: isoDateSchema,
+      balanceCents: z.number().int().min(0),
+      amountCents: z.number().int().min(0),
+    }),
+  ),
+});
+
 export type ServiceType = z.infer<typeof serviceTypeSchema>;
 export type SubscriberStatus = z.infer<typeof subscriberStatusSchema>;
 export type ServiceAccountStatus = z.infer<typeof serviceAccountStatusSchema>;
@@ -345,3 +466,16 @@ export type LedgerEntryListQuery = z.infer<typeof ledgerEntryListQuerySchema>;
 export type GenerateBillingInput = z.infer<typeof generateBillingInputSchema>;
 export type BillingGenerationResult = z.infer<typeof billingGenerationResultSchema>;
 export type BillingLineItemInput = z.infer<typeof invoiceLineItemSchema>;
+export type PaymentStatus = z.infer<typeof paymentStatusEnum>;
+export type PaymentAllocation = z.infer<typeof paymentAllocationSchema>;
+export type PaymentProof = z.infer<typeof paymentProofSchema>;
+export type PaymentReversal = z.infer<typeof paymentReversalSchema>;
+export type Payment = z.infer<typeof paymentSchema>;
+export type PaymentListQuery = z.infer<typeof paymentListQuerySchema>;
+export type PaymentListResponse = z.infer<typeof paymentListSchema>;
+export type PaymentProofInput = z.infer<typeof paymentProofInputSchema>;
+export type CreatePaymentInput = z.infer<typeof createPaymentInputSchema>;
+export type VerifyPaymentInput = z.infer<typeof verifyPaymentInputSchema>;
+export type ReversePaymentInput = z.infer<typeof reversePaymentInputSchema>;
+export type AllocationPreviewInput = z.infer<typeof allocationPreviewInputSchema>;
+export type AllocationPreview = z.infer<typeof allocationPreviewSchema>;

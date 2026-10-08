@@ -38,7 +38,7 @@ const roleGrants: Record<string, readonly string[]> = {
   "Administrator": permissionDefinitions
     .map(([key]) => key)
     .filter((key) => key !== "backup.restore" && key !== "audit.view"),
-  "Cashier": ["subscriber.view", "payment.create"],
+  "Cashier": ["subscriber.view", "payment.create", "payment.verify_gcash"],
   "Collection Supervisor": ["subscriber.view", "collection.manage", "collection.reconcile", "report.view", "report.export"],
   "Accounting / Auditor": ["subscriber.view", "payment.reverse", "report.view", "report.export", "audit.view"],
   "Technician": ["subscriber.view", "service.view", "service.update"],

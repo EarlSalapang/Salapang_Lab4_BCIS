@@ -1,7 +1,10 @@
 import type {
+  AllocationPreview,
+  AllocationPreviewInput,
   CollectionArea,
   CreateCollectionAreaInput,
   CreateInvoiceInput,
+  CreatePaymentInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
@@ -11,6 +14,10 @@ import type {
   InvoiceListResponse,
   LedgerEntryListQuery,
   LedgerEntryListResponse,
+  Payment,
+  PaymentListQuery,
+  PaymentListResponse,
+  ReversePaymentInput,
   ServiceAccountDetail,
   ServiceAccountListQuery,
   ServiceAccountListResponse,
@@ -22,6 +29,7 @@ import type {
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
+  VerifyPaymentInput,
 } from "@bcis/shared";
 
 export class CatalogError extends Error {
@@ -64,6 +72,13 @@ listInvoices(query: InvoiceListQuery): Promise<InvoiceListResponse>;
   updateInvoice(id: string, input: UpdateInvoiceInput, actor: DirectoryActor): Promise<Invoice>;
   generateInvoices(input: GenerateBillingInput, actor: DirectoryActor): Promise<BillingGenerationResult>;
   listLedgerEntries(query: LedgerEntryListQuery): Promise<LedgerEntryListResponse>;
+
+  previewAllocation(input: AllocationPreviewInput): Promise<AllocationPreview>;
+  listPayments(query: PaymentListQuery): Promise<PaymentListResponse>;
+  getPayment(id: string): Promise<Payment | null>;
+  createPayment(input: CreatePaymentInput, actor: DirectoryActor): Promise<Payment>;
+  verifyPayment(id: string, input: VerifyPaymentInput, actor: DirectoryActor): Promise<Payment>;
+  reversePayment(id: string, input: ReversePaymentInput, actor: DirectoryActor): Promise<Payment>;
 }
 
 export interface BillingGenerationResult {

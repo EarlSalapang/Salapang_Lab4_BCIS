@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
+  allocationPreviewSchema,
   invoiceListSchema,
   ledgerEntryListSchema,
+  paymentListSchema,
   serviceAccountDetailSchema,
   serviceAccountListSchema,
   subscriberDetailSchema,
@@ -23,6 +25,9 @@ const allDirectoryPermissions = [
   "plan.manage",
   "collection.manage",
   "billing.generate",
+  "payment.create",
+  "payment.verify_gcash",
+  "payment.reverse",
 ];
 
 interface TestServer {
@@ -708,5 +713,301 @@ describe("billing and ledger", () => {
     });
     expect(malformed.statusCode).toBe(400);
     await context.server.close();
+  });
+});
+
+describe("payments, allocation and receipts", () => {
+  it("previews and applies oldest-first allocation with a ledger credit and receipt number", async () => {
+    const context = await createServer();
+    const plan = await createPlan(context, { monthlyPriceCents: 99_900 });
+    const subscriber = await createSubscriber(context);
+    await createServiceAccount(context, subscriber.id, plan.id);
+
+    await context.server.inject({
+      method: "POST",
+      url: "/billing/generate",
+      headers: authHeaders(context.token),
+      payload: billingPeriod,
+    });
+    await context.server.inject({
+      method: "POST",
+      url: "/billing/generate",
+      headers: authHeaders(context.token),
+      payload: {
+        billingPeriodStart: "2026-02-01",
+        billingPeriodEnd: "2026-02-28",
+        issueDate: "2026-02-01",
+        dueDate: "2026-02-15",
+      },
+    });
+
+    const preview = await context.server.inject({
+      method: "POST",
+      url: "/payments/preview",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 150_000 },
+    });
+    expect(preview.statusCode).toBe(200);
+    const previewBody = allocationPreviewSchema.parse(preview.json());
+    expect(previewBody.allocations).toHaveLength(2);
+    expect(previewBody.allocations[0]).toMatchObject({ amountCents: 99_900 });
+    expect(previewBody.allocations[1]).toMatchObject({ amountCents: 50_100 });
+    expect(previewBody.allocatedCents).toBe(150_000);
+    expect(previewBody.unallocatedCents).toBe(0);
+
+    const paid = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 150_000, method: "cash" },
+    });
+    expect(paid.statusCode).toBe(201);
+    const payment = paid.json().payment;
+    expect(payment.receiptNumber).toMatch(/^RCPT-\d{6}$/);
+    expect(payment).toMatchObject({ status: "posted", allocatedCents: 150_000, unallocatedCents: 0 });
+    expect(payment.allocations).toHaveLength(2);
+
+    const payments = await context.server.inject({
+      method: "GET",
+      url: `/payments?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(payments.statusCode).toBe(200);
+    expect(paymentListSchema.parse(payments.json()).total).toBe(1);
+
+    const invoices = await context.server.inject({
+      method: "GET",
+      url: `/invoices?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    const list = invoiceListSchema.parse(invoices.json());
+    const byPeriod = [...list.invoices].sort((left, right) => left.billingPeriodStart.localeCompare(right.billingPeriodStart));
+    expect(byPeriod[0]).toMatchObject({ status: "paid", balanceCents: 0 });
+    expect(byPeriod[1]).toMatchObject({ status: "partially_paid", balanceCents: 49_800 });
+
+    const ledger = await context.server.inject({
+      method: "GET",
+      url: `/ledger?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    const entries = ledgerEntryListSchema.parse(ledger.json());
+    const credit = entries.entries.find((entry) => entry.sourceType === "payment");
+    expect(credit).toMatchObject({
+      entryType: "credit",
+      amountCents: 150_000,
+      balanceCents: 49_800,
+      createdByUserId: context.userId,
+    });
+    await context.server.close();
+  });
+
+  it("handles partial payments and advance (unallocated) credits", async () => {
+    const context = await createServer();
+    const plan = await createPlan(context, { monthlyPriceCents: 50_000 });
+    const subscriber = await createSubscriber(context);
+    await createServiceAccount(context, subscriber.id, plan.id);
+    await context.server.inject({
+      method: "POST",
+      url: "/billing/generate",
+      headers: authHeaders(context.token),
+      payload: billingPeriod,
+    });
+
+    const partial = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 20_000, method: "cash" },
+    });
+    expect(partial.json().payment).toMatchObject({ allocatedCents: 20_000, unallocatedCents: 0 });
+
+    const invoiceAfterPartial = await context.server.inject({
+      method: "GET",
+      url: `/invoices?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(invoiceListSchema.parse(invoiceAfterPartial.json()).invoices[0]).toMatchObject({
+      status: "partially_paid",
+      amountPaidCents: 20_000,
+      balanceCents: 30_000,
+    });
+
+    const advance = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 45_000, method: "gcash", referenceNumber: "GC-ADV-1" },
+    });
+    expect(advance.json().payment).toMatchObject({ status: "pending", allocatedCents: 0, unallocatedCents: 45_000 });
+
+    const verified = await context.server.inject({
+      method: "POST",
+      url: `/payments/${advance.json().payment.id}/verify`,
+      headers: authHeaders(context.token),
+      payload: { decision: "verify" },
+    });
+    expect(verified.statusCode).toBe(200);
+    expect(verified.json().payment).toMatchObject({ status: "posted", allocatedCents: 30_000, unallocatedCents: 15_000 });
+
+    const invoiceAfterAdvance = await context.server.inject({
+      method: "GET",
+      url: `/invoices?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(invoiceListSchema.parse(invoiceAfterAdvance.json()).invoices[0]).toMatchObject({
+      status: "paid",
+      balanceCents: 0,
+    });
+    await context.server.close();
+  });
+
+  it("requires GCash verification, rejects duplicate references, and records rejections", async () => {
+    const context = await createServer();
+    const subscriber = await createSubscriber(context);
+
+    const first = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 5_000, method: "gcash", referenceNumber: "GC-DUP" },
+    });
+    expect(first.statusCode).toBe(201);
+    expect(first.json().payment.status).toBe("pending");
+
+    const duplicate = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 5_000, method: "gcash", referenceNumber: "GC-DUP" },
+    });
+    expect(duplicate.statusCode).toBe(409);
+
+    const ledger = await context.server.inject({
+      method: "GET",
+      url: `/ledger?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(ledgerEntryListSchema.parse(ledger.json()).total).toBe(0);
+
+    const rejected = await context.server.inject({
+      method: "POST",
+      url: `/payments/${first.json().payment.id}/verify`,
+      headers: authHeaders(context.token),
+      payload: { decision: "reject", note: "Unverifiable reference" },
+    });
+    expect(rejected.statusCode).toBe(200);
+    expect(rejected.json().payment).toMatchObject({ status: "rejected", verificationNote: "Unverifiable reference" });
+    await context.server.close();
+  });
+
+  it("reverses a posted payment, restores invoice balances, and keeps the audit trail", async () => {
+    const context = await createServer();
+    const plan = await createPlan(context, { monthlyPriceCents: 75_000 });
+    const subscriber = await createSubscriber(context);
+    await createServiceAccount(context, subscriber.id, plan.id);
+    await context.server.inject({
+      method: "POST",
+      url: "/billing/generate",
+      headers: authHeaders(context.token),
+      payload: billingPeriod,
+    });
+
+    const paid = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 75_000, method: "cash" },
+    });
+    const payment = paid.json().payment;
+
+    const reversed = await context.server.inject({
+      method: "POST",
+      url: `/payments/${payment.id}/reverse`,
+      headers: authHeaders(context.token),
+      payload: { reason: "Cheque cleared twice" },
+    });
+    expect(reversed.statusCode).toBe(200);
+    expect(reversed.json().payment).toMatchObject({ status: "reversed", allocatedCents: 0 });
+    expect(reversed.json().payment.reversal).toMatchObject({ reason: "Cheque cleared twice", reversedByUserId: context.userId });
+
+    const invoice = await context.server.inject({
+      method: "GET",
+      url: `/invoices?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(invoiceListSchema.parse(invoice.json()).invoices[0]).toMatchObject({
+      status: "posted",
+      amountPaidCents: 0,
+      balanceCents: 75_000,
+    });
+
+    const ledger = await context.server.inject({
+      method: "GET",
+      url: `/ledger?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    const entries = ledgerEntryListSchema.parse(ledger.json());
+    expect(entries.total).toBe(3);
+    expect(entries.entries.find((entry) => entry.sourceType === "reversal")).toMatchObject({
+      entryType: "debit",
+      amountCents: 75_000,
+      balanceCents: 75_000,
+    });
+
+    const secondReverse = await context.server.inject({
+      method: "POST",
+      url: `/payments/${payment.id}/reverse`,
+      headers: authHeaders(context.token),
+      payload: { reason: "Try again" },
+    });
+    expect(secondReverse.statusCode).toBe(409);
+    await context.server.close();
+  });
+
+  it("enforces payment permissions and validates identifiers", async () => {
+    const context = await createServer();
+    const subscriber = await createSubscriber(context);
+
+    const readOnly = await createServer(["subscriber.view"], context.directory);
+    const forbiddenCreate = await readOnly.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(readOnly.token),
+      payload: { subscriberId: subscriber.id, amountCents: 1_000, method: "cash" },
+    });
+    expect(forbiddenCreate.statusCode).toBe(403);
+
+    const cashier = await createServer(["subscriber.view", "payment.create"], context.directory);
+    const created = await cashier.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(cashier.token),
+      payload: { subscriberId: subscriber.id, amountCents: 1_000, method: "cash" },
+    });
+    expect(created.statusCode).toBe(201);
+    const forbiddenReverse = await cashier.server.inject({
+      method: "POST",
+      url: `/payments/${created.json().payment.id}/reverse`,
+      headers: authHeaders(cashier.token),
+      payload: { reason: "Not allowed" },
+    });
+    expect(forbiddenReverse.statusCode).toBe(403);
+
+    const unknown = await context.server.inject({
+      method: "GET",
+      url: `/payments/${randomUUID()}`,
+      headers: authHeaders(context.token),
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    const malformed = await context.server.inject({
+      method: "GET",
+      url: "/payments/123",
+      headers: authHeaders(context.token),
+    });
+    expect(malformed.statusCode).toBe(400);
+    await context.server.close();
+    await readOnly.server.close();
+    await cashier.server.close();
   });
 });

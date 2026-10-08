@@ -229,3 +229,64 @@ export const ledgerEntries = pgTable("ledger_entries", {
   check("ledger_entries_source_check", sql`source_type IN ('invoice', 'payment', 'adjustment', 'reversal')`),
   check("ledger_entries_amount_check", sql`amount_cents <> 0`),
 ]);
+
+export const payments = pgTable("payments", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  receiptNumber: text("receipt_number").notNull().unique(),
+  subscriberId: uuid("subscriber_id").notNull().references(() => subscribers.id, { onDelete: "restrict" }),
+  amountCents: integer("amount_cents").notNull(),
+  method: text("method").notNull().default("cash"),
+  referenceNumber: text("reference_number"),
+  notes: text("notes"),
+  status: text("status").notNull().default("posted"),
+  verificationNote: text("verification_note"),
+  paymentDate: timestamp("payment_date", { withTimezone: true }).notNull().defaultNow(),
+  verifiedAt: timestamp("verified_at", { withTimezone: true }),
+  verifiedByUserId: uuid("verified_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("payments_subscriber_idx").on(table.subscriberId),
+  index("payments_status_idx").on(table.status),
+  index("payments_method_idx").on(table.method),
+  index("payments_payment_date_idx").on(table.paymentDate),
+  index("payments_reference_idx").on(table.referenceNumber),
+  check("payments_amount_check", sql`amount_cents > 0`),
+  check("payments_method_check", sql`method IN ('cash', 'gcash', 'bank_transfer', 'cheque', 'other')`),
+  check("payments_status_check", sql`status IN ('pending', 'posted', 'reversed', 'rejected')`),
+]);
+
+export const paymentProofs = pgTable("payment_proofs", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  paymentId: uuid("payment_id").notNull().references(() => payments.id, { onDelete: "cascade" }),
+  fileName: text("file_name").notNull(),
+  contentType: text("content_type").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  storagePath: text("storage_path").notNull(),
+  uploadedByUserId: uuid("uploaded_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("payment_proofs_payment_idx").on(table.paymentId),
+  check("payment_proofs_size_check", sql`size_bytes > 0`),
+]);
+
+export const paymentAllocations = pgTable("payment_allocations", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  paymentId: uuid("payment_id").notNull().references(() => payments.id, { onDelete: "cascade" }),
+  invoiceId: uuid("invoice_id").notNull().references(() => invoices.id, { onDelete: "restrict" }),
+  amountCents: integer("amount_cents").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("payment_allocations_payment_idx").on(table.paymentId),
+  index("payment_allocations_invoice_idx").on(table.invoiceId),
+  check("payment_allocations_amount_check", sql`amount_cents > 0`),
+]);
+
+export const paymentReversals = pgTable("payment_reversals", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  paymentId: uuid("payment_id").notNull().unique().references(() => payments.id, { onDelete: "cascade" }),
+  reason: text("reason").notNull(),
+  reversedByUserId: uuid("reversed_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});

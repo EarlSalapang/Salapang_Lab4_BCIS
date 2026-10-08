@@ -1,8 +1,10 @@
 import Fastify from "fastify";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import {
+  allocationPreviewInputSchema,
   createCollectionAreaInputSchema,
   createInvoiceInputSchema,
+  createPaymentInputSchema,
   createPlanInputSchema,
   createServiceAccountInputSchema,
   createSubscriberInputSchema,
@@ -12,12 +14,15 @@ import {
   invoiceListQuerySchema,
   ledgerEntryListQuerySchema,
   loginInputSchema,
+  paymentListQuerySchema,
+  reversePaymentInputSchema,
   serviceAccountListQuerySchema,
   subscriberListQuerySchema,
   updateInvoiceInputSchema,
   updatePlanInputSchema,
   updateServiceAccountInputSchema,
   updateSubscriberInputSchema,
+  verifyPaymentInputSchema,
 } from "@bcis/shared";
 import type { AuthUser } from "@bcis/shared";
 
@@ -202,6 +207,9 @@ export function buildServer(
   const managePlans = requirePermission("plan.manage", "You do not have permission to manage service plans.");
   const manageCollections = requirePermission("collection.manage", "You do not have permission to manage collection areas.");
   const manageBilling = requirePermission("billing.generate", "You do not have permission to generate billing.");
+  const createPayments = requirePermission("payment.create", "You do not have permission to post payments.");
+  const verifyPayments = requirePermission("payment.verify_gcash", "You do not have permission to verify GCash payments.");
+  const reversePayments = requirePermission("payment.reverse", "You do not have permission to reverse payments.");
 
   const parseIdentifier = (reply: FastifyReply, value: unknown, resource: string) => {
     const parsed = identifierSchema.safeParse(value);
@@ -449,6 +457,84 @@ export function buildServer(
     if (!parsed.success) return reply.code(400).send({ error: "Enter valid ledger filters." });
     try {
       return await store.listLedgerEntries(parsed.data);
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/payments", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = paymentListQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid payment list filters." });
+    try {
+      return await store.listPayments(parsed.data);
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/payments/:id", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "payment");
+    if (!id) return;
+    try {
+      const payment = await store.getPayment(id);
+      if (!payment) return reply.code(404).send({ error: "Payment was not found." });
+      return { payment };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/payments/preview", { preHandler: createPayments }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = allocationPreviewInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Select a subscriber and a positive payment amount." });
+    try {
+      return await store.previewAllocation(parsed.data);
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/payments", { preHandler: createPayments }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = createPaymentInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid payment details." });
+    try {
+      return reply.code(201).send({ payment: await store.createPayment(parsed.data, actorOf(request)) });
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/payments/:id/verify", { preHandler: verifyPayments }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "payment");
+    if (!id) return;
+    const parsed = verifyPaymentInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Choose whether to verify or reject the payment." });
+    try {
+      return { payment: await store.verifyPayment(id, parsed.data, actorOf(request)) };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/payments/:id/reverse", { preHandler: reversePayments }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "payment");
+    if (!id) return;
+    const parsed = reversePaymentInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter a reversal reason of at least 5 characters." });
+    try {
+      return { payment: await store.reversePayment(id, parsed.data, actorOf(request)) };
     } catch (error) {
       return sendError(request, reply, error);
     }

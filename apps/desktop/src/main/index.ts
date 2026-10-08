@@ -1,5 +1,7 @@
 import { app, BrowserWindow, ipcMain } from "electron";
 import {
+  allocationPreviewInputSchema,
+  allocationPreviewSchema,
   apiHealthSchema,
   authUserSchema,
   billingGenerationResultSchema,
@@ -7,6 +9,7 @@ import {
   collectionAreaResponseSchema,
   createCollectionAreaInputSchema,
   createInvoiceInputSchema,
+  createPaymentInputSchema,
   createPlanInputSchema,
   createServiceAccountInputSchema,
   createSubscriberInputSchema,
@@ -19,6 +22,9 @@ import {
   loginInputSchema,
   loginResponseSchema,
   managedUserSchema,
+  paymentListSchema,
+  paymentResponseSchema,
+  reversePaymentInputSchema,
   serviceAccountListSchema,
   serviceAccountResponseSchema,
   servicePlanListSchema,
@@ -30,6 +36,7 @@ import {
   updatePlanInputSchema,
   updateServiceAccountInputSchema,
   updateSubscriberInputSchema,
+  verifyPaymentInputSchema,
 } from "@bcis/shared";
 import type { DesktopApiHealth, ManagedUser } from "@bcis/shared";
 import type { ZodType } from "zod";
@@ -395,6 +402,46 @@ ipcMain.handle("bcis:list-ledger", (_event, params: unknown) =>
     `/ledger${queryString(listParams(params, ["subscriberId", "invoiceId", "page", "pageSize"]))}`,
     ledgerEntryListSchema,
   ));
+
+ipcMain.handle("bcis:list-payments", (_event, params: unknown) =>
+  directoryRequest(
+    `/payments${queryString(listParams(params, ["query", "status", "method", "subscriberId", "from", "to", "page", "pageSize"]))}`,
+    paymentListSchema,
+  ));
+
+ipcMain.handle("bcis:get-payment", (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  return directoryRequest(`/payments/${identifier.data}`, paymentResponseSchema);
+});
+
+ipcMain.handle("bcis:preview-allocation", (_event, input: unknown) => {
+  const parsed = allocationPreviewInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Select a subscriber and a positive payment amount." };
+  return directoryRequest("/payments/preview", allocationPreviewSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:create-payment", (_event, input: unknown) => {
+  const parsed = createPaymentInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Enter valid payment details." };
+  return directoryRequest("/payments", paymentResponseSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:verify-payment", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return { ok: false, message: split.message };
+  const parsed = verifyPaymentInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Choose whether to verify or reject the payment." };
+  return directoryRequest(`/payments/${split.id}/verify`, paymentResponseSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:reverse-payment", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return { ok: false, message: split.message };
+  const parsed = reversePaymentInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Enter a reversal reason of at least 5 characters." };
+  return directoryRequest(`/payments/${split.id}/reverse`, paymentResponseSchema, { method: "POST", body: parsed.data });
+});
 
 
 function createWindow() {
