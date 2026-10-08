@@ -2,9 +2,18 @@ import type { Pool, PoolClient, QueryResultRow } from "pg";
 import type {
   CollectionArea,
   CreateCollectionAreaInput,
+  CreateInvoiceInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
+  GenerateBillingInput,
+  Invoice,
+  InvoiceLineItem,
+  InvoiceListQuery,
+  InvoiceListResponse,
+  LedgerEntry,
+  LedgerEntryListQuery,
+  LedgerEntryListResponse,
   ServiceAccountDetail,
   ServiceAccountListQuery,
   ServiceAccountListResponse,
@@ -16,12 +25,13 @@ import type {
   SubscriberListQuery,
   SubscriberListResponse,
   SubscriberSummary,
+  UpdateInvoiceInput,
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
 } from "@bcis/shared";
 
-import { conflict, invalidRequest, notFound, type DirectoryActor, type DirectoryStore } from "./types.js";
+import { conflict, invalidRequest, notFound, type BillingGenerationResult, type DirectoryActor, type DirectoryStore } from "./types.js";
 
 const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
@@ -227,6 +237,96 @@ const SERVICE_ACCOUNT_SELECT = `
   JOIN service_plans sp ON sp.id = sa.plan_id
   LEFT JOIN collection_areas ca ON ca.id = sa.collection_area_id
 `;
+
+interface InvoiceRow extends QueryResultRow {
+  id: string;
+  invoice_number: string;
+  subscriber_id: string;
+  service_account_id: string | null;
+  billing_period_start: string;
+  billing_period_end: string;
+  issue_date: string;
+  due_date: string;
+  subtotal_cents: number;
+  tax_cents: number;
+  total_cents: number;
+  amount_paid_cents: number;
+  balance_cents: number;
+  status: string;
+  notes: string | null;
+  created_at: Date;
+  updated_at: Date;
+  posted_at: Date | null;
+}
+
+interface InvoiceLineRow extends QueryResultRow {
+  description: string;
+  quantity: number;
+  unit_price_cents: number;
+  amount_cents: number;
+}
+
+interface LedgerRow extends QueryResultRow {
+  id: string;
+  subscriber_id: string;
+  service_account_id: string | null;
+  invoice_id: string | null;
+  entry_date: string;
+  entry_type: string;
+  source_type: string;
+  amount_cents: number;
+  balance_cents: number;
+  description: string;
+  created_by_user_id: string | null;
+  created_at: Date;
+}
+
+function toInvoice(row: InvoiceRow, lineItems: InvoiceLineItem[]): Invoice {
+  return {
+    id: row.id,
+    invoiceNumber: row.invoice_number,
+    subscriberId: row.subscriber_id,
+    serviceAccountId: row.service_account_id ?? undefined,
+    billingPeriodStart: row.billing_period_start,
+    billingPeriodEnd: row.billing_period_end,
+    issueDate: row.issue_date,
+    dueDate: row.due_date,
+    subtotalCents: row.subtotal_cents,
+    taxCents: row.tax_cents,
+    totalCents: row.total_cents,
+    amountPaidCents: row.amount_paid_cents,
+    balanceCents: row.balance_cents,
+    status: row.status as Invoice["status"],
+    notes: row.notes,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+    postedAt: row.posted_at ? row.posted_at.toISOString() : null,
+    lineItems,
+  };
+}
+
+function toLedgerEntry(row: LedgerRow): LedgerEntry {
+  return {
+    id: row.id,
+    subscriberId: row.subscriber_id,
+    serviceAccountId: row.service_account_id,
+    invoiceId: row.invoice_id,
+    entryDate: row.entry_date,
+    entryType: row.entry_type as LedgerEntry["entryType"],
+    sourceType: row.source_type as LedgerEntry["sourceType"],
+    amountCents: row.amount_cents,
+    balanceCents: row.balance_cents,
+    description: row.description,
+    createdByUserId: row.created_by_user_id,
+    createdAt: row.created_at.toISOString(),
+  };
+}
+
+function normalizeInvoiceLineItem(item: InvoiceLineItem): InvoiceLineItem {
+  const quantity = item.quantity ?? 1;
+  const amountCents = item.amountCents || quantity * item.unitPriceCents;
+  return { ...item, quantity, amountCents };
+}
 
 function isUniqueViolation(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === UNIQUE_VIOLATION;
@@ -731,6 +831,297 @@ export class PostgresDirectoryStore implements DirectoryStore {
     return this.requireServiceAccount(id);
   }
 
+  async listInvoices(query: InvoiceListQuery): Promise<InvoiceListResponse> {
+    const filters: string[] = [];
+    const values: unknown[] = [];
+
+    if (query.query) {
+      values.push(`%${query.query}%`);
+      filters.push(`invoice_number ILIKE $${values.length}`);
+    }
+    if (query.status) {
+      values.push(query.status);
+      filters.push(`status = $${values.length}`);
+    }
+    if (query.subscriberId) {
+      values.push(query.subscriberId);
+      filters.push(`subscriber_id = $${values.length}`);
+    }
+    if (query.serviceAccountId) {
+      values.push(query.serviceAccountId);
+      filters.push(`service_account_id = $${values.length}`);
+    }
+    if (query.from) {
+      values.push(query.from);
+      filters.push(`billing_period_start >= $${values.length}`);
+    }
+    if (query.to) {
+      values.push(query.to);
+      filters.push(`billing_period_end <= $${values.length}`);
+    }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+
+    const countResult = await this.pool.query<{ total: string }>(
+      `SELECT count(*)::text AS total FROM invoices ${where}`,
+      values,
+    );
+    const pageSize = query.pageSize;
+    const offset = (query.page - 1) * pageSize;
+    const result = await this.pool.query<InvoiceRow>(
+      `SELECT * FROM invoices ${where}
+       ORDER BY issue_date DESC, created_at DESC
+       LIMIT ${pageSize} OFFSET ${offset}`,
+      values,
+    );
+
+    return {
+      invoices: result.rows.map((row) => toInvoice(row, [])),
+      total: Number(countResult.rows[0]?.total ?? 0),
+      page: query.page,
+      pageSize,
+    };
+  }
+
+  async getInvoice(id: string): Promise<Invoice | null> {
+    const result = await this.pool.query<InvoiceRow>(`SELECT * FROM invoices WHERE id = $1`, [id]);
+    const row = result.rows[0];
+    if (!row) return null;
+    const lineItems = await this.pool.query<InvoiceLineRow>(
+      `SELECT description, quantity, unit_price_cents, amount_cents
+       FROM invoice_line_items WHERE invoice_id = $1 ORDER BY created_at ASC`,
+      [id],
+    );
+    return toInvoice(row, lineItems.rows.map((line) => ({
+      description: line.description,
+      quantity: line.quantity,
+      unitPriceCents: line.unit_price_cents,
+      amountCents: line.amount_cents,
+    })));
+  }
+
+  async createInvoice(input: CreateInvoiceInput, _actor: DirectoryActor): Promise<Invoice> {
+    const lineItems = input.lineItems.map(normalizeInvoiceLineItem);
+    const subtotalCents = lineItems.reduce((sum, item) => sum + item.amountCents, 0);
+    if (subtotalCents <= 0) throw invalidRequest("An invoice must have a positive amount.");
+
+    const client = await this.pool.connect();
+    let invoiceId = "";
+    try {
+      await client.query("BEGIN");
+      await requireSubscriberExists(client, input.subscriberId);
+      if (input.serviceAccountId) {
+        await requireAccountForSubscriber(client, input.serviceAccountId, input.subscriberId);
+      }
+      await assertNoExistingInvoice(
+        client,
+        input.subscriberId,
+        input.serviceAccountId ?? null,
+        input.billingPeriodStart,
+        input.billingPeriodEnd,
+      );
+      const invoiceNumber = await nextNumber(client, "invoice", "INV-");
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO invoices
+           (invoice_number, subscriber_id, service_account_id, billing_period_start, billing_period_end,
+            issue_date, due_date, subtotal_cents, tax_cents, total_cents, amount_paid_cents, balance_cents,
+            status, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $8, 0, $8, 'draft', $9)
+         RETURNING id`,
+        [
+          invoiceNumber,
+          input.subscriberId,
+          input.serviceAccountId ?? null,
+          input.billingPeriodStart,
+          input.billingPeriodEnd,
+          input.issueDate,
+          input.dueDate,
+          subtotalCents,
+          input.notes ?? null,
+        ],
+      );
+      invoiceId = inserted.rows[0]!.id;
+      await insertInvoiceLineItems(client, invoiceId, lineItems);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if (isForeignKeyViolation(error)) throw invalidRequest("The selected subscriber or service account is unavailable.");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return (await this.getInvoice(invoiceId))!;
+  }
+
+  async updateInvoice(id: string, input: UpdateInvoiceInput, actor: DirectoryActor): Promise<Invoice> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const currentResult = await client.query<InvoiceRow>(`SELECT * FROM invoices WHERE id = $1 FOR UPDATE`, [id]);
+      const current = currentResult.rows[0];
+      if (!current) throw notFound("Invoice");
+      if (current.status === "void" && input.status && input.status !== "void") {
+        throw conflict("A void invoice cannot change status.");
+      }
+      const nextStatus = input.status ?? current.status;
+      const assignments = ["status = $1", "updated_at = now()"];
+      const values: unknown[] = [nextStatus];
+      if (input.notes !== undefined) {
+        values.push(input.notes ?? null);
+        assignments.push(`notes = $${values.length}`);
+      }
+      const posting = input.status === "posted" && current.status !== "posted";
+      if (posting) {
+        if (current.balance_cents <= 0) throw invalidRequest("Only invoices with an outstanding balance can be posted.");
+        assignments.push("posted_at = now()");
+      }
+      values.push(id);
+      await client.query(
+        `UPDATE invoices SET ${assignments.join(", ")} WHERE id = $${values.length}`,
+        values,
+      );
+      if (input.status === "posted" && current.status !== "posted") {
+        await postLedgerEntry(client, current, actor, "debit", "invoice", current.total_cents, "Invoice posted");
+      } else if (input.status === "void" && current.status === "posted") {
+        await postLedgerEntry(
+          client,
+          current,
+          actor,
+          "credit",
+          "reversal",
+          current.total_cents - current.amount_paid_cents,
+          "Invoice voided",
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return (await this.getInvoice(id))!;
+  }
+
+  async generateInvoices(input: GenerateBillingInput, actor: DirectoryActor): Promise<BillingGenerationResult> {
+    const client = await this.pool.connect();
+    const createdIds: string[] = [];
+    let skipped = 0;
+    try {
+      await client.query("BEGIN");
+      const params: unknown[] = [];
+      let filter = `WHERE sa.status NOT IN ('TERMINATED', 'DISCONNECTED')`;
+      if (input.serviceAccountIds && input.serviceAccountIds.length > 0) {
+        params.push(input.serviceAccountIds);
+        filter += ` AND sa.id = ANY($${params.length}::uuid[])`;
+      }
+      const accounts = await client.query<{
+        id: string;
+        subscriber_id: string;
+        current_rate_cents: number;
+        plan_name: string;
+      }>(
+        `SELECT sa.id, sa.subscriber_id, sa.current_rate_cents, sp.name AS plan_name
+         FROM service_accounts sa JOIN service_plans sp ON sp.id = sa.plan_id
+         ${filter}`,
+        params,
+      );
+      for (const account of accounts.rows) {
+        const duplicate = await client.query<{ id: string }>(
+          `SELECT id FROM invoices
+           WHERE subscriber_id = $1 AND service_account_id IS NOT DISTINCT FROM $2
+             AND billing_period_start = $3 AND billing_period_end = $4
+             AND status <> 'void'
+           LIMIT 1`,
+          [account.subscriber_id, account.id, input.billingPeriodStart, input.billingPeriodEnd],
+        );
+        if (duplicate.rowCount) {
+          skipped += 1;
+          continue;
+        }
+        const invoiceNumber = await nextNumber(client, "invoice", "INV-");
+        const inserted = await client.query<InvoiceRow>(
+          `INSERT INTO invoices
+             (invoice_number, subscriber_id, service_account_id, billing_period_start, billing_period_end,
+              issue_date, due_date, subtotal_cents, tax_cents, total_cents, amount_paid_cents, balance_cents,
+              status, posted_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $8, 0, $8, 'posted', now())
+           RETURNING *`,
+          [
+            invoiceNumber,
+            account.subscriber_id,
+            account.id,
+            input.billingPeriodStart,
+            input.billingPeriodEnd,
+            input.issueDate,
+            input.dueDate,
+            account.current_rate_cents,
+          ],
+        );
+        const invoiceRow = inserted.rows[0]!;
+        await insertInvoiceLineItems(client, invoiceRow.id, [{
+          description: `Monthly service fee (${account.plan_name})`,
+          quantity: 1,
+          unitPriceCents: account.current_rate_cents,
+          amountCents: account.current_rate_cents,
+        }]);
+        await postLedgerEntry(
+          client,
+          invoiceRow,
+          actor,
+          "debit",
+          "invoice",
+          account.current_rate_cents,
+          "Monthly billing posted",
+        );
+        createdIds.push(invoiceRow.id);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      if (isUniqueViolation(error)) throw conflict("An invoice already exists for that account and billing period.");
+      throw error;
+    } finally {
+      client.release();
+    }
+    const created: Invoice[] = [];
+    for (const id of createdIds) {
+      const invoice = await this.getInvoice(id);
+      if (invoice) created.push(invoice);
+    }
+    return { created, skipped };
+  }
+
+  async listLedgerEntries(query: LedgerEntryListQuery): Promise<LedgerEntryListResponse> {
+    const filters: string[] = [];
+    const values: unknown[] = [];
+    if (query.subscriberId) {
+      values.push(query.subscriberId);
+      filters.push(`subscriber_id = $${values.length}`);
+    }
+    if (query.invoiceId) {
+      values.push(query.invoiceId);
+      filters.push(`invoice_id = $${values.length}`);
+    }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const countResult = await this.pool.query<{ total: string }>(
+      `SELECT count(*)::text AS total FROM ledger_entries ${where}`,
+      values,
+    );
+    const offset = (query.page - 1) * query.pageSize;
+    const result = await this.pool.query<LedgerRow>(
+      `SELECT * FROM ledger_entries ${where}
+       ORDER BY created_at DESC, id DESC
+       LIMIT ${query.pageSize} OFFSET ${offset}`,
+      values,
+    );
+    return {
+      entries: result.rows.map(toLedgerEntry),
+      total: Number(countResult.rows[0]?.total ?? 0),
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
   private async requireSubscriber(id: string): Promise<SubscriberDetail> {
     const subscriber = await this.getSubscriber(id);
     if (!subscriber) throw notFound("Subscriber");
@@ -767,4 +1158,101 @@ async function assertAreaAvailable(client: PoolClient, areaId: string): Promise<
     [areaId],
   );
   if (result.rowCount !== 1) throw invalidRequest("The selected collection area is unavailable.");
+}
+
+async function requireSubscriberExists(client: PoolClient, subscriberId: string): Promise<void> {
+  const result = await client.query<{ id: string }>(`SELECT id FROM subscribers WHERE id = $1`, [subscriberId]);
+  if (result.rowCount !== 1) throw invalidRequest("The selected subscriber is unavailable.");
+}
+
+async function requireAccountForSubscriber(
+  client: PoolClient,
+  serviceAccountId: string,
+  subscriberId: string,
+): Promise<void> {
+  const result = await client.query<{ subscriber_id: string }>(
+    `SELECT subscriber_id FROM service_accounts WHERE id = $1`,
+    [serviceAccountId],
+  );
+  const row = result.rows[0];
+  if (!row) throw invalidRequest("The selected service account is unavailable.");
+  if (row.subscriber_id !== subscriberId) {
+    throw invalidRequest("The service account does not belong to the selected subscriber.");
+  }
+}
+
+async function assertNoExistingInvoice(
+  client: PoolClient,
+  subscriberId: string,
+  serviceAccountId: string | null,
+  billingPeriodStart: string,
+  billingPeriodEnd: string,
+): Promise<void> {
+  const result = await client.query<{ id: string }>(
+    `SELECT id FROM invoices
+     WHERE subscriber_id = $1 AND service_account_id IS NOT DISTINCT FROM $2
+       AND billing_period_start = $3 AND billing_period_end = $4
+       AND status <> 'void'
+     LIMIT 1`,
+    [subscriberId, serviceAccountId, billingPeriodStart, billingPeriodEnd],
+  );
+  if (result.rowCount) {
+    throw conflict("An invoice already exists for that account and billing period.");
+  }
+}
+
+async function insertInvoiceLineItems(
+  client: PoolClient,
+  invoiceId: string,
+  lineItems: InvoiceLineItem[],
+): Promise<void> {
+  for (const item of lineItems) {
+    await client.query(
+      `INSERT INTO invoice_line_items (invoice_id, description, quantity, unit_price_cents, amount_cents)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [invoiceId, item.description, item.quantity ?? 1, item.unitPriceCents, item.amountCents],
+    );
+  }
+}
+
+interface InvoiceLedgerContext {
+  id: string;
+  subscriber_id: string;
+  service_account_id: string | null;
+  issue_date: string;
+}
+
+async function postLedgerEntry(
+  client: PoolClient,
+  invoice: InvoiceLedgerContext,
+  actor: DirectoryActor,
+  entryType: "debit" | "credit",
+  sourceType: "invoice" | "payment" | "adjustment" | "reversal",
+  amountCents: number,
+  description: string,
+): Promise<void> {
+  const balanceResult = await client.query<{ balance: string }>(
+    `SELECT COALESCE(SUM(CASE WHEN entry_type = 'debit' THEN amount_cents ELSE -amount_cents END), 0)::text AS balance
+     FROM ledger_entries WHERE subscriber_id = $1`,
+    [invoice.subscriber_id],
+  );
+  const previous = Number(balanceResult.rows[0]?.balance ?? 0);
+  const delta = entryType === "debit" ? amountCents : -amountCents;
+  await client.query(
+    `INSERT INTO ledger_entries
+       (subscriber_id, service_account_id, invoice_id, entry_date, entry_type, source_type, amount_cents, balance_cents, description, created_by_user_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [
+      invoice.subscriber_id,
+      invoice.service_account_id,
+      invoice.id,
+      invoice.issue_date,
+      entryType,
+      sourceType,
+      amountCents,
+      previous + delta,
+      description,
+      actor.userId,
+    ],
+  );
 }

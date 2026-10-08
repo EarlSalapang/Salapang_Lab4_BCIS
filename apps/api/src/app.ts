@@ -2,14 +2,19 @@ import Fastify from "fastify";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import {
   createCollectionAreaInputSchema,
+  createInvoiceInputSchema,
   createPlanInputSchema,
   createServiceAccountInputSchema,
   createSubscriberInputSchema,
   createUserInputSchema,
+  generateBillingInputSchema,
   identifierSchema,
+  invoiceListQuerySchema,
+  ledgerEntryListQuerySchema,
   loginInputSchema,
   serviceAccountListQuerySchema,
   subscriberListQuerySchema,
+  updateInvoiceInputSchema,
   updatePlanInputSchema,
   updateServiceAccountInputSchema,
   updateSubscriberInputSchema,
@@ -196,6 +201,7 @@ export function buildServer(
   const updateSubscribers = requirePermission("subscriber.update", "You do not have permission to update subscriber records.");
   const managePlans = requirePermission("plan.manage", "You do not have permission to manage service plans.");
   const manageCollections = requirePermission("collection.manage", "You do not have permission to manage collection areas.");
+  const manageBilling = requirePermission("billing.generate", "You do not have permission to generate billing.");
 
   const parseIdentifier = (reply: FastifyReply, value: unknown, resource: string) => {
     const parsed = identifierSchema.safeParse(value);
@@ -367,6 +373,82 @@ export function buildServer(
     if (!parsed.success) return reply.code(400).send({ error: "Enter valid service account details." });
     try {
       return { serviceAccount: await store.updateServiceAccount(id, parsed.data, actorOf(request)) };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/invoices", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = invoiceListQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid invoice list filters." });
+    try {
+      return await store.listInvoices(parsed.data);
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/invoices/:id", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "invoice");
+    if (!id) return;
+    try {
+      const invoice = await store.getInvoice(id);
+      if (!invoice) return reply.code(404).send({ error: "Invoice was not found." });
+      return { invoice };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/invoices", { preHandler: manageBilling }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = createInvoiceInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid invoice details." });
+    try {
+      return reply.code(201).send({ invoice: await store.createInvoice(parsed.data, actorOf(request)) });
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.patch("/invoices/:id", { preHandler: manageBilling }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const id = parseIdentifier(reply, (request.params as { id?: unknown }).id, "invoice");
+    if (!id) return;
+    const parsed = updateInvoiceInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid invoice details." });
+    try {
+      return { invoice: await store.updateInvoice(id, parsed.data, actorOf(request)) };
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.post("/billing/generate", { preHandler: manageBilling }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = generateBillingInputSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "Enter a valid billing period and dates." });
+    try {
+      return await store.generateInvoices(parsed.data, actorOf(request));
+    } catch (error) {
+      return sendError(request, reply, error);
+    }
+  });
+
+  server.get("/ledger", { preHandler: viewDirectory }, async (request, reply) => {
+    const store = requireDirectory(reply);
+    if (!store) return;
+    const parsed = ledgerEntryListQuerySchema.safeParse(request.query ?? {});
+    if (!parsed.success) return reply.code(400).send({ error: "Enter valid ledger filters." });
+    try {
+      return await store.listLedgerEntries(parsed.data);
     } catch (error) {
       return sendError(request, reply, error);
     }

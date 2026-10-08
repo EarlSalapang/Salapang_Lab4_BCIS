@@ -2,14 +2,20 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import {
   apiHealthSchema,
   authUserSchema,
+  billingGenerationResultSchema,
   collectionAreaListSchema,
   collectionAreaResponseSchema,
   createCollectionAreaInputSchema,
+  createInvoiceInputSchema,
   createPlanInputSchema,
   createServiceAccountInputSchema,
   createSubscriberInputSchema,
   createUserInputSchema,
+  generateBillingInputSchema,
   identifierSchema,
+  invoiceListSchema,
+  invoiceResponseSchema,
+  ledgerEntryListSchema,
   loginInputSchema,
   loginResponseSchema,
   managedUserSchema,
@@ -20,6 +26,7 @@ import {
   stringArraySchema,
   subscriberListSchema,
   subscriberResponseSchema,
+  updateInvoiceInputSchema,
   updatePlanInputSchema,
   updateServiceAccountInputSchema,
   updateSubscriberInputSchema,
@@ -348,6 +355,46 @@ ipcMain.handle("bcis:update-service-account", (_event, payload: unknown) => {
     body: parsed.data,
   });
 });
+
+ipcMain.handle("bcis:list-invoices", (_event, params: unknown) =>
+  directoryRequest(
+    `/invoices${queryString(
+      listParams(params, ["query", "status", "subscriberId", "serviceAccountId", "from", "to", "page", "pageSize"]),
+    )}`,
+    invoiceListSchema,
+  ));
+
+ipcMain.handle("bcis:get-invoice", (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  return directoryRequest(`/invoices/${identifier.data}`, invoiceResponseSchema);
+});
+
+ipcMain.handle("bcis:create-invoice", (_event, input: unknown) => {
+  const parsed = createInvoiceInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Enter valid invoice details." };
+  return directoryRequest("/invoices", invoiceResponseSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:update-invoice", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return split;
+  const parsed = updateInvoiceInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Enter valid invoice details." };
+  return directoryRequest(`/invoices/${split.id}`, invoiceResponseSchema, { method: "PATCH", body: parsed.data });
+});
+
+ipcMain.handle("bcis:generate-billing", (_event, input: unknown) => {
+  const parsed = generateBillingInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Enter a valid billing period and dates." };
+  return directoryRequest("/billing/generate", billingGenerationResultSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:list-ledger", (_event, params: unknown) =>
+  directoryRequest(
+    `/ledger${queryString(listParams(params, ["subscriberId", "invoiceId", "page", "pageSize"]))}`,
+    ledgerEntryListSchema,
+  ));
 
 
 function createWindow() {

@@ -2,9 +2,18 @@ import { randomUUID } from "node:crypto";
 import type {
   CollectionArea,
   CreateCollectionAreaInput,
+  CreateInvoiceInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
+  GenerateBillingInput,
+  Invoice,
+  InvoiceLineItem,
+  InvoiceListQuery,
+  InvoiceListResponse,
+  LedgerEntry,
+  LedgerEntryListQuery,
+  LedgerEntryListResponse,
   ServiceAccountDetail,
   ServiceAccountListQuery,
   ServiceAccountListResponse,
@@ -14,13 +23,14 @@ import type {
   SubscriberListQuery,
   SubscriberListResponse,
   SubscriberSummary,
+  UpdateInvoiceInput,
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
 } from "@bcis/shared";
 
 import type { AuthStore } from "../auth/types.js";
-import { conflict, invalidRequest, notFound, type DirectoryActor, type DirectoryStore } from "./types.js";
+import { conflict, invalidRequest, notFound, type BillingGenerationResult, type DirectoryActor, type DirectoryStore } from "./types.js";
 
 export class MemoryDirectoryStore implements DirectoryStore {
   private readonly plans = new Map<string, ServicePlan>();
@@ -28,6 +38,8 @@ export class MemoryDirectoryStore implements DirectoryStore {
   private readonly subscribers = new Map<string, SubscriberDetail>();
   private readonly serviceAccounts = new Map<string, ServiceAccountDetail>();
   private readonly counters = new Map<string, number>();
+  private readonly invoices = new Map<string, Invoice>();
+  private readonly ledgerEntries: LedgerEntry[] = [];
 
   private nextNumber(name: string, prefix: string): string {
     const value = (this.counters.get(name) ?? 0) + 1;
@@ -364,6 +376,232 @@ export class MemoryDirectoryStore implements DirectoryStore {
     }
     return structuredClone(updated);
   }
+
+  async listInvoices(query: InvoiceListQuery): Promise<InvoiceListResponse> {
+    const matches = [...this.invoices.values()]
+      .filter((invoice) => {
+        if (query.status && invoice.status !== query.status) return false;
+        if (query.subscriberId && invoice.subscriberId !== query.subscriberId) return false;
+        if (query.serviceAccountId && invoice.serviceAccountId !== query.serviceAccountId) return false;
+        if (query.from && invoice.billingPeriodStart < query.from) return false;
+        if (query.to && invoice.billingPeriodEnd > query.to) return false;
+        if (query.query && !invoice.invoiceNumber.toLowerCase().includes(query.query.toLowerCase())) return false;
+        return true;
+      })
+      .sort((left, right) => right.issueDate.localeCompare(left.issueDate) || right.createdAt.localeCompare(left.createdAt));
+    const start = (query.page - 1) * query.pageSize;
+    return {
+      invoices: matches.slice(start, start + query.pageSize).map(({ lineItems: _lineItems, ...rest }) => rest),
+      total: matches.length,
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
+  async getInvoice(id: string): Promise<Invoice | null> {
+    const invoice = this.invoices.get(id);
+    return invoice ? structuredClone(invoice) : null;
+  }
+
+  async createInvoice(input: CreateInvoiceInput, _actor: DirectoryActor): Promise<Invoice> {
+    const subscriber = this.subscribers.get(input.subscriberId);
+    if (!subscriber) throw notFound("Subscriber");
+    if (input.serviceAccountId) {
+      const account = this.serviceAccounts.get(input.serviceAccountId);
+      if (!account) throw invalidRequest("The selected service account is unavailable.");
+      if (account.subscriberId !== subscriber.id) {
+        throw invalidRequest("The service account does not belong to the selected subscriber.");
+      }
+    }
+    this.assertNotDuplicate(input.subscriberId, input.serviceAccountId ?? null, input.billingPeriodStart, input.billingPeriodEnd);
+    const invoice = this.buildInvoice({
+      subscriberId: input.subscriberId,
+      serviceAccountId: input.serviceAccountId ?? null,
+      billingPeriodStart: input.billingPeriodStart,
+      billingPeriodEnd: input.billingPeriodEnd,
+      issueDate: input.issueDate,
+      dueDate: input.dueDate,
+      lineItems: input.lineItems.map(normalizeLineItem),
+      notes: input.notes ?? null,
+      status: "draft",
+    });
+    this.invoices.set(invoice.id, invoice);
+    return structuredClone(invoice);
+  }
+
+  async updateInvoice(id: string, input: UpdateInvoiceInput, actor: DirectoryActor): Promise<Invoice> {
+    const invoice = this.invoices.get(id);
+    if (!invoice) throw notFound("Invoice");
+    if (invoice.status === "void" && input.status && input.status !== "void") {
+      throw conflict("A void invoice cannot change status.");
+    }
+    const updated: Invoice = {
+      ...invoice,
+      status: input.status ?? invoice.status,
+      notes: input.notes !== undefined ? input.notes ?? null : invoice.notes,
+      updatedAt: this.now(),
+    };
+    if (input.status === "posted" && invoice.status !== "posted") {
+      if (updated.balanceCents <= 0) throw invalidRequest("Only invoices with an outstanding balance can be posted.");
+      updated.postedAt = this.now();
+      this.postLedger(updated, actor, "debit", "invoice", updated.totalCents, "Invoice posted");
+    } else if (input.status === "void" && invoice.status === "posted") {
+      this.postLedger(updated, actor, "credit", "reversal", updated.totalCents - updated.amountPaidCents, "Invoice voided");
+    }
+    this.invoices.set(id, updated);
+    return structuredClone(updated);
+  }
+
+  async generateInvoices(input: GenerateBillingInput, actor: DirectoryActor): Promise<BillingGenerationResult> {
+    const targets = [...this.serviceAccounts.values()].filter((account) => {
+      if (account.status === "TERMINATED" || account.status === "DISCONNECTED") return false;
+      if (input.serviceAccountIds && !input.serviceAccountIds.includes(account.id)) return false;
+      return true;
+    });
+    const created: Invoice[] = [];
+    let skipped = 0;
+    for (const account of targets) {
+      if (this.hasBillableInvoice(account.subscriberId, account.id, input.billingPeriodStart, input.billingPeriodEnd)) {
+        skipped += 1;
+        continue;
+      }
+      const lineItem: InvoiceLineItem = {
+        description: `Monthly service fee (${account.planName})`,
+        quantity: 1,
+        unitPriceCents: account.currentRateCents,
+        amountCents: account.currentRateCents,
+      };
+      const invoice = this.buildInvoice({
+        subscriberId: account.subscriberId,
+        serviceAccountId: account.id,
+        billingPeriodStart: input.billingPeriodStart,
+        billingPeriodEnd: input.billingPeriodEnd,
+        issueDate: input.issueDate,
+        dueDate: input.dueDate,
+        lineItems: [lineItem],
+        notes: null,
+        status: "posted",
+      });
+      invoice.postedAt = this.now();
+      this.invoices.set(invoice.id, invoice);
+      this.postLedger(invoice, actor, "debit", "invoice", invoice.totalCents, "Monthly billing posted");
+      created.push(structuredClone(invoice));
+    }
+    return { created, skipped };
+  }
+
+  async listLedgerEntries(query: LedgerEntryListQuery): Promise<LedgerEntryListResponse> {
+    const matches = this.ledgerEntries
+      .filter((entry) => {
+        if (query.subscriberId && entry.subscriberId !== query.subscriberId) return false;
+        if (query.invoiceId && entry.invoiceId !== query.invoiceId) return false;
+        return true;
+      })
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    const start = (query.page - 1) * query.pageSize;
+    return {
+      entries: matches.slice(start, start + query.pageSize).map((entry) => structuredClone(entry)),
+      total: matches.length,
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
+  private buildInvoice(fields: {
+    subscriberId: string;
+    serviceAccountId: string | null;
+    billingPeriodStart: string;
+    billingPeriodEnd: string;
+    issueDate: string;
+    dueDate: string;
+    lineItems: InvoiceLineItem[];
+    notes: string | null;
+    status: Invoice["status"];
+  }): Invoice {
+    const subtotalCents = fields.lineItems.reduce((sum, item) => sum + item.amountCents, 0);
+    if (subtotalCents <= 0) throw invalidRequest("An invoice must have a positive amount.");
+    const now = this.now();
+    return {
+      id: randomUUID(),
+      invoiceNumber: this.nextNumber("invoice", "INV-"),
+      subscriberId: fields.subscriberId,
+      serviceAccountId: fields.serviceAccountId ?? undefined,
+      billingPeriodStart: fields.billingPeriodStart,
+      billingPeriodEnd: fields.billingPeriodEnd,
+      issueDate: fields.issueDate,
+      dueDate: fields.dueDate,
+      subtotalCents,
+      taxCents: 0,
+      totalCents: subtotalCents,
+      amountPaidCents: 0,
+      balanceCents: subtotalCents,
+      status: fields.status,
+      notes: fields.notes,
+      createdAt: now,
+      updatedAt: now,
+      postedAt: null,
+      lineItems: fields.lineItems,
+    };
+  }
+
+  private hasBillableInvoice(
+    subscriberId: string,
+    serviceAccountId: string | null,
+    billingPeriodStart: string,
+    billingPeriodEnd: string,
+  ): boolean {
+    return [...this.invoices.values()].some((invoice) => {
+      if (invoice.status === "void") return false;
+      if (invoice.subscriberId !== subscriberId) return false;
+      if ((invoice.serviceAccountId ?? null) !== serviceAccountId) return false;
+      return invoice.billingPeriodStart === billingPeriodStart && invoice.billingPeriodEnd === billingPeriodEnd;
+    });
+  }
+
+  private assertNotDuplicate(
+    subscriberId: string,
+    serviceAccountId: string | null,
+    billingPeriodStart: string,
+    billingPeriodEnd: string,
+  ): void {
+    if (this.hasBillableInvoice(subscriberId, serviceAccountId, billingPeriodStart, billingPeriodEnd)) {
+      throw conflict("An invoice already exists for that account and billing period.");
+    }
+  }
+
+  private postLedger(
+    invoice: Invoice,
+    actor: DirectoryActor,
+    entryType: LedgerEntry["entryType"],
+    sourceType: LedgerEntry["sourceType"],
+    amountCents: number,
+    description: string,
+  ): void {
+    const previous = this.ledgerEntries
+      .filter((entry) => entry.subscriberId === invoice.subscriberId)
+      .reduce((balance, entry) => balance + (entry.entryType === "debit" ? entry.amountCents : -entry.amountCents), 0);
+    const delta = entryType === "debit" ? amountCents : -amountCents;
+    this.ledgerEntries.push({
+      id: randomUUID(),
+      subscriberId: invoice.subscriberId,
+      serviceAccountId: invoice.serviceAccountId ?? null,
+      invoiceId: invoice.id,
+      entryDate: invoice.issueDate,
+      entryType,
+      sourceType,
+      amountCents,
+      balanceCents: previous + delta,
+      description,
+      createdByUserId: actor.userId,
+      createdAt: this.now(),
+    });
+  }
+}
+
+function normalizeLineItem(item: InvoiceLineItem): InvoiceLineItem {
+  const quantity = item.quantity ?? 1;
+  const amountCents = item.amountCents || quantity * item.unitPriceCents;
+  return { ...item, quantity, amountCents };
 }
 
 function toSummary(subscriber: SubscriberDetail): SubscriberSummary {

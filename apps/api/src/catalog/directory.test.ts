@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
+  invoiceListSchema,
+  ledgerEntryListSchema,
   serviceAccountDetailSchema,
   serviceAccountListSchema,
   subscriberDetailSchema,
@@ -20,6 +22,7 @@ const allDirectoryPermissions = [
   "subscriber.update",
   "plan.manage",
   "collection.manage",
+  "billing.generate",
 ];
 
 interface TestServer {
@@ -512,6 +515,198 @@ describe("directory availability and administrative authorization", () => {
       headers: authHeaders(context.token),
     });
     expect(response.statusCode).toBe(403);
+    await context.server.close();
+  });
+});
+
+async function createServiceAccount(
+  context: TestServer,
+  subscriberId: string,
+  planId: string,
+): Promise<{ id: string }> {
+  const response = await context.server.inject({
+    method: "POST",
+    url: `/subscribers/${subscriberId}/service-accounts`,
+    headers: authHeaders(context.token),
+    payload: { planId, installationAddress: "Purok 2, San Isidro" },
+  });
+  expect(response.statusCode).toBe(201);
+  return response.json().serviceAccount;
+}
+
+const billingPeriod = {
+  billingPeriodStart: "2026-01-01",
+  billingPeriodEnd: "2026-01-31",
+  issueDate: "2026-01-01",
+  dueDate: "2026-01-15",
+};
+
+describe("billing and ledger", () => {
+  it("generates monthly invoices once and posts a ledger debit", async () => {
+    const context = await createServer();
+    const plan = await createPlan(context, { monthlyPriceCents: 99_900 });
+    const subscriber = await createSubscriber(context);
+    await createServiceAccount(context, subscriber.id, plan.id);
+
+    const firstRun = await context.server.inject({
+      method: "POST",
+      url: "/billing/generate",
+      headers: authHeaders(context.token),
+      payload: billingPeriod,
+    });
+    expect(firstRun.statusCode).toBe(200);
+    const firstBody = firstRun.json();
+    expect(firstBody.created).toHaveLength(1);
+    expect(firstBody.skipped).toBe(0);
+    expect(firstBody.created[0].invoiceNumber).toMatch(/^INV-\d{6}$/);
+    expect(firstBody.created[0]).toMatchObject({ status: "posted", totalCents: 99_900, balanceCents: 99_900 });
+
+    const secondRun = await context.server.inject({
+      method: "POST",
+      url: "/billing/generate",
+      headers: authHeaders(context.token),
+      payload: billingPeriod,
+    });
+    expect(secondRun.json().created).toHaveLength(0);
+    expect(secondRun.json().skipped).toBe(1);
+
+    const invoices = await context.server.inject({
+      method: "GET",
+      url: `/invoices?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(invoices.statusCode).toBe(200);
+    expect(invoiceListSchema.parse(invoices.json()).total).toBe(1);
+
+    const ledger = await context.server.inject({
+      method: "GET",
+      url: `/ledger?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(ledger.statusCode).toBe(200);
+    const entries = ledgerEntryListSchema.parse(ledger.json());
+    expect(entries.entries).toHaveLength(1);
+    expect(entries.entries[0]).toMatchObject({
+      entryType: "debit",
+      sourceType: "invoice",
+      amountCents: 99_900,
+      balanceCents: 99_900,
+      createdByUserId: context.userId,
+    });
+    await context.server.close();
+  });
+
+  it("creates a draft invoice and posts the ledger debit on posting", async () => {
+    const context = await createServer();
+    const subscriber = await createSubscriber(context);
+
+    const created = await context.server.inject({
+      method: "POST",
+      url: "/invoices",
+      headers: authHeaders(context.token),
+      payload: {
+        subscriberId: subscriber.id,
+        ...billingPeriod,
+        lineItems: [{ description: "Monthly service fee", quantity: 1, unitPriceCents: 50_000, amountCents: 50_000 }],
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const invoice = created.json().invoice;
+    expect(invoice.status).toBe("draft");
+    expect(invoice.postedAt).toBeNull();
+
+    const duplicate = await context.server.inject({
+      method: "POST",
+      url: "/invoices",
+      headers: authHeaders(context.token),
+      payload: {
+        subscriberId: subscriber.id,
+        ...billingPeriod,
+        lineItems: [{ description: "Duplicate", quantity: 1, unitPriceCents: 50_000, amountCents: 50_000 }],
+      },
+    });
+    expect(duplicate.statusCode).toBe(409);
+
+    const beforePosting = await context.server.inject({
+      method: "GET",
+      url: `/ledger?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(ledgerEntryListSchema.parse(beforePosting.json()).total).toBe(0);
+
+    const posted = await context.server.inject({
+      method: "PATCH",
+      url: `/invoices/${invoice.id}`,
+      headers: authHeaders(context.token),
+      payload: { status: "posted" },
+    });
+    expect(posted.statusCode).toBe(200);
+    expect(posted.json().invoice.status).toBe("posted");
+    expect(posted.json().invoice.postedAt).not.toBeNull();
+
+    const afterPosting = await context.server.inject({
+      method: "GET",
+      url: `/ledger?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    const entries = ledgerEntryListSchema.parse(afterPosting.json());
+    expect(entries.total).toBe(1);
+    expect(entries.entries[0]).toMatchObject({ entryType: "debit", amountCents: 50_000, balanceCents: 50_000 });
+    await context.server.close();
+  });
+
+  it("requires billing.generate to create or generate invoices", async () => {
+    const context = await createServer();
+    const plan = await createPlan(context, { monthlyPriceCents: 10_000 });
+    const subscriber = await createSubscriber(context);
+    await createServiceAccount(context, subscriber.id, plan.id);
+
+    const readOnly = await createServer(["subscriber.view"]);
+    const forbiddenCreate = await readOnly.server.inject({
+      method: "POST",
+      url: "/invoices",
+      headers: authHeaders(readOnly.token),
+      payload: {
+        subscriberId: subscriber.id,
+        ...billingPeriod,
+        lineItems: [{ description: "Fee", quantity: 1, unitPriceCents: 1_000, amountCents: 1_000 }],
+      },
+    });
+    expect(forbiddenCreate.statusCode).toBe(403);
+
+    const forbiddenGenerate = await readOnly.server.inject({
+      method: "POST",
+      url: "/billing/generate",
+      headers: authHeaders(readOnly.token),
+      payload: billingPeriod,
+    });
+    expect(forbiddenGenerate.statusCode).toBe(403);
+
+    const readable = await readOnly.server.inject({
+      method: "GET",
+      url: `/invoices?subscriberId=${subscriber.id}`,
+      headers: authHeaders(readOnly.token),
+    });
+    expect(readable.statusCode).toBe(200);
+    await context.server.close();
+    await readOnly.server.close();
+  });
+
+  it("returns 404 for unknown invoices and 400 for malformed identifiers", async () => {
+    const context = await createServer();
+    const unknown = await context.server.inject({
+      method: "GET",
+      url: `/invoices/${randomUUID()}`,
+      headers: authHeaders(context.token),
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    const malformed = await context.server.inject({
+      method: "GET",
+      url: "/invoices/123",
+      headers: authHeaders(context.token),
+    });
+    expect(malformed.statusCode).toBe(400);
     await context.server.close();
   });
 });

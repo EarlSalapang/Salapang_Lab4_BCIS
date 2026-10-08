@@ -1,7 +1,9 @@
 import type {
   AuthUser,
+  BillingGenerationResult,
   CollectionArea,
   CreateCollectionAreaInput,
+  CreateInvoiceInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
@@ -9,6 +11,11 @@ import type {
   DesktopApiHealth,
   DesktopAuthResult,
   DesktopResult,
+  GenerateBillingInput,
+  Invoice,
+  InvoiceListResponse,
+  InvoiceStatus,
+  LedgerEntryListResponse,
   ManagedUser,
   ServiceAccountDetail,
   ServiceAccountListResponse,
@@ -17,6 +24,7 @@ import type {
   SubscriberDetail,
   SubscriberListResponse,
   SubscriberStatus,
+  UpdateInvoiceInput,
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
@@ -70,6 +78,26 @@ declare global {
         id: string,
         input: UpdateServiceAccountInput,
       ) => Promise<DesktopResult<{ serviceAccount: ServiceAccountDetail }>>;
+      listInvoices: (params?: {
+        query?: string;
+        status?: InvoiceStatus;
+        subscriberId?: string;
+        serviceAccountId?: string;
+        from?: string;
+        to?: string;
+        page?: number;
+        pageSize?: number;
+      }) => Promise<DesktopResult<InvoiceListResponse>>;
+      getInvoice: (id: string) => Promise<DesktopResult<{ invoice: Invoice }>>;
+      createInvoice: (input: CreateInvoiceInput) => Promise<DesktopResult<{ invoice: Invoice }>>;
+      updateInvoice: (id: string, input: UpdateInvoiceInput) => Promise<DesktopResult<{ invoice: Invoice }>>;
+      generateBilling: (input: GenerateBillingInput) => Promise<DesktopResult<BillingGenerationResult>>;
+      listLedgerEntries: (params?: {
+        subscriberId?: string;
+        invoiceId?: string;
+        page?: number;
+        pageSize?: number;
+      }) => Promise<DesktopResult<LedgerEntryListResponse>>;
     };
   }
 }

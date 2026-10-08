@@ -247,18 +247,101 @@ export const invoiceSchema = z.object({
   createdAt: isoDateTimeSchema,
   updatedAt: isoDateTimeSchema,
   postedAt: isoDateTimeSchema.nullable().optional(),
+  lineItems: z.array(invoiceLineItemSchema).optional(),
+});
+
+export const invoiceListQuerySchema = z.object({
+  query: optionalText(120),
+  status: invoiceStatusEnum.optional(),
+  subscriberId: identifierSchema.optional(),
+  serviceAccountId: identifierSchema.optional(),
+  from: isoDateSchema.optional(),
+  to: isoDateSchema.optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25),
 });
 
 export const invoiceListSchema = z.object({ invoices: z.array(invoiceSchema), total: z.number().int().min(0), page: z.number().int().min(1), pageSize: z.number().int().min(1) });
 export const invoiceResponseSchema = z.object({ invoice: invoiceSchema });
 export const createInvoiceInputSchema = z.object({ subscriberId: identifierSchema, serviceAccountId: identifierSchema.optional(), billingPeriodStart: isoDateSchema, billingPeriodEnd: isoDateSchema, issueDate: isoDateSchema, dueDate: isoDateSchema, lineItems: z.array(invoiceLineItemSchema).min(1), notes: z.string().max(500).optional() });
-export const updateInvoiceInputSchema = z.object({ status: invoiceStatusEnum.optional(), notes: z.string().max(500).optional() }).partial();
+export const updateInvoiceInputSchema = z.object({ status: invoiceStatusEnum.optional(), notes: z.string().max(500).optional() }).partial().refine((value) => Object.keys(value).length > 0, { message: "Provide at least one field to update." });
 
+export const ledgerEntryTypeSchema = z.enum(["debit", "credit"]);
+export const ledgerSourceTypeSchema = z.enum(["invoice", "payment", "adjustment", "reversal"]);
+export const ledgerEntrySchema = z.object({
+  id: identifierSchema,
+  subscriberId: identifierSchema,
+  serviceAccountId: identifierSchema.nullable().optional(),
+  invoiceId: identifierSchema.nullable().optional(),
+  entryDate: isoDateSchema,
+  entryType: ledgerEntryTypeSchema,
+  sourceType: ledgerSourceTypeSchema,
+  amountCents: z.number().int(),
+  balanceCents: z.number().int(),
+  description: z.string().min(1).max(255),
+  createdByUserId: identifierSchema.nullable().optional(),
+  createdAt: isoDateTimeSchema,
+});
+export const ledgerEntryListSchema = z.object({
+  entries: z.array(ledgerEntrySchema),
+  total: z.number().int().min(0),
+  page: z.number().int().min(1),
+  pageSize: z.number().int().min(1),
+});
+export const ledgerEntryListQuerySchema = z.object({
+  subscriberId: identifierSchema.optional(),
+  invoiceId: identifierSchema.optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(50),
+});
+
+export const generateBillingInputSchema = z.object({
+  billingPeriodStart: isoDateSchema,
+  billingPeriodEnd: isoDateSchema,
+  issueDate: isoDateSchema,
+  dueDate: isoDateSchema,
+  serviceAccountIds: z.array(identifierSchema).min(1).optional(),
+});
+
+export const billingGenerationResultSchema = z.object({
+  created: z.array(invoiceSchema),
+  skipped: z.number().int().min(0),
+});
+
+export type ServiceType = z.infer<typeof serviceTypeSchema>;
+export type SubscriberStatus = z.infer<typeof subscriberStatusSchema>;
+export type ServiceAccountStatus = z.infer<typeof serviceAccountStatusSchema>;
+export type ServicePlan = z.infer<typeof servicePlanSchema>;
+export type CreatePlanInput = z.infer<typeof createPlanInputSchema>;
+export type UpdatePlanInput = z.infer<typeof updatePlanInputSchema>;
+export type CollectionArea = z.infer<typeof collectionAreaSchema>;
+export type CreateCollectionAreaInput = z.infer<typeof createCollectionAreaInputSchema>;
+export type SubscriberSummary = z.infer<typeof subscriberSummarySchema>;
+export type SubscriberAddress = z.infer<typeof subscriberAddressSchema>;
+export type SubscriberDetail = z.infer<typeof subscriberDetailSchema>;
+export type CreateSubscriberInput = z.infer<typeof createSubscriberInputSchema>;
+export type UpdateSubscriberInput = z.infer<typeof updateSubscriberInputSchema>;
+export type SubscriberListQuery = z.infer<typeof subscriberListQuerySchema>;
+export type SubscriberListResponse = z.infer<typeof subscriberListSchema>;
+export type ServiceAccountSummary = z.infer<typeof serviceAccountSummarySchema>;
+export type ServiceAccountDetail = z.infer<typeof serviceAccountDetailSchema>;
+export type ServiceEvent = z.infer<typeof serviceEventSchema>;
+export type CreateServiceAccountInput = z.infer<typeof createServiceAccountInputSchema>;
+export type UpdateServiceAccountInput = z.infer<typeof updateServiceAccountInputSchema>;
+export type ServiceAccountListQuery = z.infer<typeof serviceAccountListQuerySchema>;
+export type ServiceAccountListResponse = z.infer<typeof serviceAccountListSchema>;
 
 export type InvoiceStatus = z.infer<typeof invoiceStatusEnum>;
 export type PaymentMethod = z.infer<typeof paymentMethodEnum>;
 export type InvoiceLineItem = z.infer<typeof invoiceLineItemSchema>;
 export type Invoice = z.infer<typeof invoiceSchema>;
+export type InvoiceListQuery = z.infer<typeof invoiceListQuerySchema>;
 export type InvoiceListResponse = z.infer<typeof invoiceListSchema>;
 export type CreateInvoiceInput = z.infer<typeof createInvoiceInputSchema>;
 export type UpdateInvoiceInput = z.infer<typeof updateInvoiceInputSchema>;
+export type LedgerEntry = z.infer<typeof ledgerEntrySchema>;
+export type LedgerEntryListResponse = z.infer<typeof ledgerEntryListSchema>;
+export type LedgerEntryListQuery = z.infer<typeof ledgerEntryListQuerySchema>;
+export type GenerateBillingInput = z.infer<typeof generateBillingInputSchema>;
+export type BillingGenerationResult = z.infer<typeof billingGenerationResultSchema>;
+export type BillingLineItemInput = z.infer<typeof invoiceLineItemSchema>;

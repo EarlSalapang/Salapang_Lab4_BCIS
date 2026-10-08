@@ -1,8 +1,10 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
   AuthUser,
+  BillingGenerationResult,
   CollectionArea,
   CreateCollectionAreaInput,
+  CreateInvoiceInput,
   CreatePlanInput,
   CreateServiceAccountInput,
   CreateSubscriberInput,
@@ -10,6 +12,10 @@ import type {
   DesktopApiHealth,
   DesktopAuthResult,
   DesktopResult,
+  GenerateBillingInput,
+  InvoiceListResponse,
+  InvoiceStatus,
+  LedgerEntryListResponse,
   ManagedUser,
   ServiceAccountDetail,
   ServiceAccountListResponse,
@@ -18,6 +24,7 @@ import type {
   SubscriberDetail,
   SubscriberListResponse,
   SubscriberStatus,
+  UpdateInvoiceInput,
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
@@ -85,4 +92,31 @@ contextBridge.exposeInMainWorld("bcis", {
     input: UpdateServiceAccountInput,
   ): Promise<DesktopResult<{ serviceAccount: ServiceAccountDetail }>> =>
     ipcRenderer.invoke("bcis:update-service-account", { id, input }),
+  listInvoices: (params?: {
+    query?: string;
+    status?: InvoiceStatus;
+    subscriberId?: string;
+    serviceAccountId?: string;
+    from?: string;
+    to?: string;
+    page?: number;
+    pageSize?: number;
+  }): Promise<DesktopResult<InvoiceListResponse>> => ipcRenderer.invoke("bcis:list-invoices", params),
+  getInvoice: (id: string): Promise<DesktopResult<{ invoice: InvoiceListResponse["invoices"][number] }>> =>
+    ipcRenderer.invoke("bcis:get-invoice", id),
+  createInvoice: (input: CreateInvoiceInput): Promise<DesktopResult<{ invoice: InvoiceListResponse["invoices"][number] }>> =>
+    ipcRenderer.invoke("bcis:create-invoice", input),
+  updateInvoice: (
+    id: string,
+    input: UpdateInvoiceInput,
+  ): Promise<DesktopResult<{ invoice: InvoiceListResponse["invoices"][number] }>> =>
+    ipcRenderer.invoke("bcis:update-invoice", { id, input }),
+  generateBilling: (input: GenerateBillingInput): Promise<DesktopResult<BillingGenerationResult>> =>
+    ipcRenderer.invoke("bcis:generate-billing", input),
+  listLedgerEntries: (params?: {
+    subscriberId?: string;
+    invoiceId?: string;
+    page?: number;
+    pageSize?: number;
+  }): Promise<DesktopResult<LedgerEntryListResponse>> => ipcRenderer.invoke("bcis:list-ledger", params),
 });
