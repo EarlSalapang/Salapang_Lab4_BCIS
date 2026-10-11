@@ -1,14 +1,22 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
+  agingReportSchema,
   allocationPreviewSchema,
+  dashboardSchema,
   invoiceListSchema,
   ledgerEntryListSchema,
+  overdueListSchema,
   paymentListSchema,
+  reportCatalogSchema,
+  reportSchema,
   serviceAccountDetailSchema,
   serviceAccountListSchema,
+  serviceSuspensionListSchema,
+  serviceSuspensionResponseSchema,
   subscriberDetailSchema,
   subscriberListSchema,
+  suspensionListSchema,
 } from "@bcis/shared";
 
 import { buildServer } from "../app.js";
@@ -24,10 +32,13 @@ const allDirectoryPermissions = [
   "subscriber.update",
   "plan.manage",
   "collection.manage",
+  "collection.reconcile",
   "billing.generate",
   "payment.create",
   "payment.verify_gcash",
   "payment.reverse",
+  "report.view",
+  "report.export",
 ];
 
 interface TestServer {
@@ -1009,5 +1020,604 @@ describe("payments, allocation and receipts", () => {
     await context.server.close();
     await readOnly.server.close();
     await cashier.server.close();
+  });
+});
+
+async function setupCollectorBatch(context: TestServer, amountCents: number, routeDate = "2026-01-10") {
+  const plan = await createPlan(context, { monthlyPriceCents: amountCents });
+  const subscriber = await createSubscriber(context);
+  await createServiceAccount(context, subscriber.id, plan.id);
+  const generated = await context.server.inject({
+    method: "POST",
+    url: "/billing/generate",
+    headers: authHeaders(context.token),
+    payload: billingPeriod,
+  });
+  expect(generated.statusCode).toBe(200);
+  expect(generated.json().created).toHaveLength(1);
+
+  const collectorResponse = await context.server.inject({
+    method: "POST",
+    url: "/collectors",
+    headers: authHeaders(context.token),
+    payload: { code: "COL-1", name: "Alex Collector", contactNumber: "09171234567" },
+  });
+  expect(collectorResponse.statusCode).toBe(201);
+  const collector = collectorResponse.json().collector;
+
+  const assignment = await context.server.inject({
+    method: "POST",
+    url: "/collector-assignments",
+    headers: authHeaders(context.token),
+    payload: { collectorId: collector.id, subscriberIds: [subscriber.id] },
+  });
+  expect(assignment.statusCode).toBe(201);
+  expect(assignment.json().assignments).toHaveLength(1);
+
+  const batchResponse = await context.server.inject({
+    method: "POST",
+    url: "/collection-batches",
+    headers: authHeaders(context.token),
+    payload: { collectorId: collector.id, routeDate },
+  });
+  expect(batchResponse.statusCode).toBe(201);
+  return { subscriber, collector, batch: batchResponse.json().batch as { id: string; batchNumber: string } };
+}
+
+describe("collector and remittance management", () => {
+  it("runs a collection batch through its lifecycle when the collector is balanced (AT-07)", async () => {
+    const context = await createServer();
+    const { subscriber, batch } = await setupCollectorBatch(context, 50_000);
+
+    expect(batch.batchNumber).toBe("BATCH-000001");
+
+    const fetched = await context.server.inject({
+      method: "GET",
+      url: `/collection-batches/${batch.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(fetched.statusCode).toBe(200);
+    expect(fetched.json().batch).toMatchObject({ status: "OPEN", expectedCents: 50_000, collectedCents: 0 });
+    expect(fetched.json().batch.accounts).toHaveLength(1);
+    expect(fetched.json().batch.accounts[0]).toMatchObject({
+      subscriberId: subscriber.id,
+      currentBillCents: 50_000,
+      arrearsCents: 0,
+      expectedCents: 50_000,
+      status: "PENDING",
+    });
+
+    const started = await context.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/start`,
+      headers: authHeaders(context.token),
+    });
+    expect(started.json().batch.status).toBe("IN_PROGRESS");
+
+    const payment = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 50_000, method: "cash", collectionBatchId: batch.id },
+    });
+    expect(payment.statusCode).toBe(201);
+    expect(payment.json().payment).toMatchObject({
+      collectionBatchId: batch.id,
+      collectorId: fetched.json().batch.collectorId,
+    });
+
+    const afterCollection = await context.server.inject({
+      method: "GET",
+      url: `/collection-batches/${batch.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(afterCollection.json().batch).toMatchObject({
+      status: "IN_PROGRESS",
+      cashCollectedCents: 50_000,
+      collectedCents: 50_000,
+    });
+    expect(afterCollection.json().batch.accounts[0].status).toBe("COLLECTED");
+
+    const submitted = await context.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/submit`,
+      headers: authHeaders(context.token),
+    });
+    expect(submitted.json().batch.status).toBe("SUBMITTED");
+
+    const remitted = await context.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/remit`,
+      headers: authHeaders(context.token),
+      payload: { amountCents: 50_000, referenceNumber: "R-1" },
+    });
+    expect(remitted.json().batch).toMatchObject({
+      status: "REMITTED",
+      remittedCents: 50_000,
+      differenceCents: 0,
+      shortageCents: 0,
+      overageCents: 0,
+    });
+
+    const reconciled = await context.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/reconcile`,
+      headers: authHeaders(context.token),
+      payload: { note: "Balanced" },
+    });
+    expect(reconciled.json().batch.status).toBe("RECONCILED");
+
+    const closed = await context.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/close`,
+      headers: authHeaders(context.token),
+      payload: { confirm: true },
+    });
+    expect(closed.json().batch.status).toBe("CLOSED");
+
+    const routeSheet = await context.server.inject({
+      method: "GET",
+      url: `/collection-batches/${batch.id}/route-sheet`,
+      headers: authHeaders(context.token),
+    });
+    expect(routeSheet.statusCode).toBe(200);
+    expect(routeSheet.json().accounts).toHaveLength(1);
+
+    const report = await context.server.inject({
+      method: "GET",
+      url: "/collector-report",
+      headers: authHeaders(context.token),
+    });
+    expect(report.statusCode).toBe(200);
+    expect(report.json().rows[0]).toMatchObject({
+      batches: 1,
+      expectedCents: 50_000,
+      collectedCents: 50_000,
+      remittedCents: 50_000,
+      shortageCents: 0,
+    });
+
+    await context.server.close();
+  });
+
+  it("records an explicit shortage when the collector remits less than collected (AT-08)", async () => {
+    const context = await createServer();
+    const { subscriber, batch } = await setupCollectorBatch(context, 20_000);
+
+    await context.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/start`,
+      headers: authHeaders(context.token),
+    });
+    const payment = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 20_000, method: "cash", collectionBatchId: batch.id },
+    });
+    expect(payment.statusCode).toBe(201);
+    await context.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/submit`,
+      headers: authHeaders(context.token),
+    });
+
+    const remitted = await context.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/remit`,
+      headers: authHeaders(context.token),
+      payload: { amountCents: 15_000 },
+    });
+    expect(remitted.json().batch).toMatchObject({
+      status: "REMITTED",
+      collectedCents: 20_000,
+      remittedCents: 15_000,
+      shortageCents: 5_000,
+      overageCents: 0,
+    });
+    await context.server.close();
+  });
+
+  it("requires collection.reconcile to remit and close a batch", async () => {
+    const context = await createServer();
+    const { batch } = await setupCollectorBatch(context, 10_000);
+
+    const supervisor = await createServer(["subscriber.view", "collection.manage"], context.directory);
+    const forbiddenRemit = await supervisor.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/remit`,
+      headers: authHeaders(supervisor.token),
+      payload: { amountCents: 10_000 },
+    });
+    expect(forbiddenRemit.statusCode).toBe(403);
+
+    const forbiddenClose = await supervisor.server.inject({
+      method: "POST",
+      url: `/collection-batches/${batch.id}/close`,
+      headers: authHeaders(supervisor.token),
+      payload: { confirm: true },
+    });
+    expect(forbiddenClose.statusCode).toBe(403);
+
+    await context.server.close();
+    await supervisor.server.close();
+  });
+});
+
+async function setupReceivable(context: TestServer, amountCents = 100_000) {
+  const plan = await createPlan(context, { monthlyPriceCents: amountCents });
+  const subscriber = await createSubscriber(context);
+  const account = await createServiceAccount(context, subscriber.id, plan.id);
+  const generated = await context.server.inject({
+    method: "POST",
+    url: "/billing/generate",
+    headers: authHeaders(context.token),
+    payload: billingPeriod,
+  });
+  expect(generated.statusCode).toBe(200);
+  expect(generated.json().created).toHaveLength(1);
+  return { plan, subscriber, account };
+}
+
+describe("receivables and service control", () => {
+  it("builds the aging report, overdue list, and suspension candidates", async () => {
+    const context = await createServer();
+    const { subscriber, account } = await setupReceivable(context, 100_000);
+
+    const current = await context.server.inject({
+      method: "GET",
+      url: "/aging-report?from=2026-01-10",
+      headers: authHeaders(context.token),
+    });
+    expect(current.statusCode).toBe(200);
+    const currentReport = agingReportSchema.parse(current.json());
+    expect(currentReport).toMatchObject({ asOf: "2026-01-10", totals: { totalBalanceCents: 100_000, currentCents: 100_000 } });
+    expect(currentReport.rows).toHaveLength(1);
+    expect(currentReport.buckets.map((bucket) => bucket.label)).toEqual([
+      "1-30 days",
+      "31-60 days",
+      "61-90 days",
+      "Over 90 days",
+    ]);
+
+    const overdue = await context.server.inject({
+      method: "GET",
+      url: "/overdue?from=2026-02-20",
+      headers: authHeaders(context.token),
+    });
+    expect(overdue.statusCode).toBe(200);
+    const overdueList = overdueListSchema.parse(overdue.json());
+    expect(overdueList).toMatchObject({ asOf: "2026-02-20", count: 1, totalBalanceCents: 100_000 });
+    expect(overdueList.invoices[0]).toMatchObject({
+      subscriberId: subscriber.id,
+      daysOverdue: 36,
+      balanceCents: 100_000,
+      status: "posted",
+    });
+
+    const report = await context.server.inject({
+      method: "GET",
+      url: "/aging-report?from=2026-02-20",
+      headers: authHeaders(context.token),
+    });
+    const aging = agingReportSchema.parse(report.json());
+    const row = aging.rows[0]!;
+    expect(row.totalBalanceCents).toBe(100_000);
+    expect(row.currentCents).toBe(0);
+    const bucket = row.buckets.find((entry) => entry.label === "31-60 days")!;
+    expect(bucket).toMatchObject({ amountCents: 100_000, count: 1 });
+    expect(aging.totals).toMatchObject({ totalBalanceCents: 100_000, currentCents: 0 });
+
+    const candidates = await context.server.inject({
+      method: "GET",
+      url: "/suspension-candidates?from=2026-02-20",
+      headers: authHeaders(context.token),
+    });
+    expect(candidates.statusCode).toBe(200);
+    const candidateList = suspensionListSchema.parse(candidates.json());
+    expect(candidateList.candidates).toHaveLength(1);
+    expect(candidateList.candidates[0]).toMatchObject({
+      subscriberId: subscriber.id,
+      serviceAccountId: account.id,
+      oldestOverdueDays: 36,
+      invoiceCount: 1,
+      totalOverdueCents: 100_000,
+    });
+
+    await context.server.close();
+  });
+
+  it("suspends, records history, blocks repeat suspension, and reconnects", async () => {
+    const context = await createServer();
+    const { account } = await setupReceivable(context, 70_000);
+
+    const suspended = await context.server.inject({
+      method: "POST",
+      url: `/service-accounts/${account.id}/suspend`,
+      headers: authHeaders(context.token),
+      payload: { reason: "Overdue balance" },
+    });
+    expect(suspended.statusCode).toBe(200);
+    const suspension = serviceSuspensionResponseSchema.parse(suspended.json()).suspension;
+    expect(suspension).toMatchObject({ serviceAccountId: account.id, reason: "Overdue balance", reconnectedAt: null });
+
+    const accountAfterSuspend = await context.server.inject({
+      method: "GET",
+      url: `/service-accounts/${account.id}`,
+      headers: authHeaders(context.token),
+    });
+    const detail = serviceAccountDetailSchema.parse(accountAfterSuspend.json().serviceAccount);
+    expect(detail.status).toBe("SUSPENDED");
+    expect(detail.events[0]).toMatchObject({ fromStatus: "ACTIVE", toStatus: "SUSPENDED", reason: "Overdue balance" });
+
+    const candidatesAfterSuspend = await context.server.inject({
+      method: "GET",
+      url: "/suspension-candidates?from=2026-02-20",
+      headers: authHeaders(context.token),
+    });
+    expect(suspensionListSchema.parse(candidatesAfterSuspend.json()).candidates).toHaveLength(0);
+
+    const repeat = await context.server.inject({
+      method: "POST",
+      url: `/service-accounts/${account.id}/suspend`,
+      headers: authHeaders(context.token),
+      payload: { reason: "Again" },
+    });
+    expect(repeat.statusCode).toBe(409);
+
+    const history = await context.server.inject({
+      method: "GET",
+      url: `/service-accounts/${account.id}/suspensions`,
+      headers: authHeaders(context.token),
+    });
+    const historyList = serviceSuspensionListSchema.parse(history.json());
+    expect(historyList.suspensions).toHaveLength(1);
+
+    const allSuspensions = await context.server.inject({
+      method: "GET",
+      url: "/suspensions",
+      headers: authHeaders(context.token),
+    });
+    expect(serviceSuspensionListSchema.parse(allSuspensions.json()).suspensions).toHaveLength(1);
+
+    const reconnected = await context.server.inject({
+      method: "POST",
+      url: `/service-accounts/${account.id}/reconnect`,
+      headers: authHeaders(context.token),
+      payload: { reason: "Payment received" },
+    });
+    expect(reconnected.statusCode).toBe(200);
+    const reconnection = serviceSuspensionResponseSchema.parse(reconnected.json()).suspension;
+    expect(reconnection).toMatchObject({ id: suspension.id, reconnectionReason: "Payment received" });
+    expect(reconnection.reconnectedAt).not.toBeNull();
+
+    const accountAfterReconnect = await context.server.inject({
+      method: "GET",
+      url: `/service-accounts/${account.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(serviceAccountDetailSchema.parse(accountAfterReconnect.json().serviceAccount).status).toBe("ACTIVE");
+
+    const reconnectAgain = await context.server.inject({
+      method: "POST",
+      url: `/service-accounts/${account.id}/reconnect`,
+      headers: authHeaders(context.token),
+      payload: {},
+    });
+    expect(reconnectAgain.statusCode).toBe(400);
+
+    await context.server.close();
+  });
+
+  it("enforces permissions and validates service control identifiers", async () => {
+    const context = await createServer();
+    const { account } = await setupReceivable(context, 30_000);
+
+    const viewer = await createServer(["subscriber.view"], context.directory);
+    const forbidden = await viewer.server.inject({
+      method: "POST",
+      url: `/service-accounts/${account.id}/suspend`,
+      headers: authHeaders(viewer.token),
+      payload: { reason: "No permission" },
+    });
+    expect(forbidden.statusCode).toBe(403);
+
+    const unknown = await context.server.inject({
+      method: "POST",
+      url: `/service-accounts/${randomUUID()}/suspend`,
+      headers: authHeaders(context.token),
+      payload: { reason: "Unknown account" },
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    const malformed = await context.server.inject({
+      method: "POST",
+      url: "/service-accounts/not-a-uuid/suspend",
+      headers: authHeaders(context.token),
+      payload: {},
+    });
+    expect(malformed.statusCode).toBe(400);
+
+    const invalidPayload = await context.server.inject({
+      method: "POST",
+      url: `/service-accounts/${account.id}/suspend`,
+      headers: authHeaders(context.token),
+      payload: { reason: "x" },
+    });
+    expect(invalidPayload.statusCode).toBe(400);
+
+    await context.server.close();
+    await viewer.server.close();
+  });
+});
+
+describe("reports and dashboard", () => {
+  it("lists the report catalog and enforces the report.view permission", async () => {
+    const context = await createServer();
+    const catalog = await context.server.inject({
+      method: "GET",
+      url: "/reports",
+      headers: authHeaders(context.token),
+    });
+    expect(catalog.statusCode).toBe(200);
+    const parsed = reportCatalogSchema.parse(catalog.json());
+    expect(parsed.reports).toHaveLength(8);
+    expect(parsed.reports.map((item) => item.key)).toContain("collection-summary");
+
+    const viewer = await createServer(["subscriber.view"], context.directory);
+    const forbidden = await viewer.server.inject({
+      method: "GET",
+      url: "/reports",
+      headers: authHeaders(viewer.token),
+    });
+    expect(forbidden.statusCode).toBe(403);
+
+    await context.server.close();
+    await viewer.server.close();
+  });
+
+  it("builds the collection, billing versus collection and revenue reports", async () => {
+    const context = await createServer();
+    const { subscriber } = await setupReceivable(context, 100_000);
+    const paid = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 100_000, method: "cash" },
+    });
+    expect(paid.statusCode).toBe(201);
+
+    const summary = await context.server.inject({
+      method: "GET",
+      url: "/reports/collection-summary",
+      headers: authHeaders(context.token),
+    });
+    expect(summary.statusCode).toBe(200);
+    const summaryReport = reportSchema.parse(summary.json());
+    expect(summaryReport.key).toBe("collection-summary");
+    expect(summaryReport.sections[0]!.rows[0]).toMatchObject({ method: "Cash", amountCents: 100_000 });
+
+    const billing = await context.server.inject({
+      method: "GET",
+      url: "/reports/billing-vs-collection",
+      headers: authHeaders(context.token),
+    });
+    const billingReport = reportSchema.parse(billing.json());
+    expect(billingReport.kpis?.find((kpi) => kpi.label === "Total billed")?.value).toBe(100_000);
+    expect(billingReport.kpis?.find((kpi) => kpi.label === "Total collected")?.value).toBe(100_000);
+
+    const revenue = await context.server.inject({
+      method: "GET",
+      url: "/reports/revenue?from=2026-01-01&to=2026-01-31",
+      headers: authHeaders(context.token),
+    });
+    expect(reportSchema.parse(revenue.json()).sections).toHaveLength(3);
+
+    await context.server.close();
+  });
+
+  it("builds the aging, overdue, subscriber master and statement reports", async () => {
+    const context = await createServer();
+    const { subscriber } = await setupReceivable(context, 100_000);
+
+    const aging = await context.server.inject({
+      method: "GET",
+      url: "/reports/ar-aging?asOf=2026-02-20",
+      headers: authHeaders(context.token),
+    });
+    expect(aging.statusCode).toBe(200);
+    const agingReport = reportSchema.parse(aging.json());
+    expect(agingReport.key).toBe("ar-aging");
+    expect(agingReport.kpis?.find((kpi) => kpi.label === "Total outstanding")?.value).toBe(100_000);
+
+    const overdue = await context.server.inject({
+      method: "GET",
+      url: "/reports/overdue?asOf=2026-02-20",
+      headers: authHeaders(context.token),
+    });
+    const overdueReport = reportSchema.parse(overdue.json());
+    expect(overdueReport.sections[0]!.rows[0]).toMatchObject({ daysOverdue: 36, balanceCents: 100_000 });
+
+    const master = await context.server.inject({
+      method: "GET",
+      url: "/reports/subscriber-master",
+      headers: authHeaders(context.token),
+    });
+    const masterReport = reportSchema.parse(master.json());
+    expect(masterReport.sections[0]!.rows[0]).toMatchObject({ accountNumber: subscriber.accountNumber });
+
+    const statement = await context.server.inject({
+      method: "GET",
+      url: `/reports/statement-of-account?subscriberId=${subscriber.id}`,
+      headers: authHeaders(context.token),
+    });
+    expect(statement.statusCode).toBe(200);
+    const statementReport = reportSchema.parse(statement.json());
+    expect(statementReport.key).toBe("statement-of-account");
+    expect(statementReport.sections[0]!.rows.some((row) => row.entryType === "Debit")).toBe(true);
+
+    await context.server.close();
+  });
+
+  it("builds the dashboard and enforces report.export on exports", async () => {
+    const context = await createServer();
+    const { subscriber } = await setupReceivable(context, 100_000);
+    const paid = await context.server.inject({
+      method: "POST",
+      url: "/payments",
+      headers: authHeaders(context.token),
+      payload: { subscriberId: subscriber.id, amountCents: 40_000, method: "cash" },
+    });
+    expect(paid.statusCode).toBe(201);
+
+    const dashboard = await context.server.inject({
+      method: "GET",
+      url: "/reports/dashboard?asOf=2026-02-20",
+      headers: authHeaders(context.token),
+    });
+    expect(dashboard.statusCode).toBe(200);
+    const body = dashboardSchema.parse(dashboard.json());
+    expect(body.asOf).toBe("2026-02-20");
+    expect(body.kpis.length).toBeGreaterThanOrEqual(6);
+    expect(body.billingVsCollection).toHaveLength(6);
+    expect(body.overdueAlerts[0]).toMatchObject({ subscriberId: subscriber.id });
+
+    const exported = await context.server.inject({
+      method: "GET",
+      url: "/reports/ar-aging/export?asOf=2026-02-20",
+      headers: authHeaders(context.token),
+    });
+    expect(exported.statusCode).toBe(200);
+    expect(reportSchema.parse(exported.json()).key).toBe("ar-aging");
+
+    const viewer = await createServer(["subscriber.view", "report.view"], context.directory);
+    const forbidden = await viewer.server.inject({
+      method: "GET",
+      url: "/reports/ar-aging/export?asOf=2026-02-20",
+      headers: authHeaders(viewer.token),
+    });
+    expect(forbidden.statusCode).toBe(403);
+
+    await context.server.close();
+    await viewer.server.close();
+  });
+
+  it("returns 404 for unknown reports and missing statement subscribers", async () => {
+    const context = await createServer();
+    const unknown = await context.server.inject({
+      method: "GET",
+      url: "/reports/not-a-report",
+      headers: authHeaders(context.token),
+    });
+    expect(unknown.statusCode).toBe(404);
+
+    const missing = await context.server.inject({
+      method: "GET",
+      url: "/reports/statement-of-account",
+      headers: authHeaders(context.token),
+    });
+    expect(missing.statusCode).toBe(404);
+
+    await context.server.close();
   });
 });

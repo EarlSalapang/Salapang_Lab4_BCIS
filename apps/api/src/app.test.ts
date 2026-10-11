@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 import { buildServer } from "./app.js";
+import { MemoryAuditStore } from "./audit/memory-store.js";
 import { hashPassword } from "./auth/passwords.js";
 import type { AuthIdentity, AuthStore, ManagedUser } from "./auth/types.js";
 
@@ -255,6 +256,133 @@ describe("authentication and authorization", () => {
 
     expect(logout.statusCode).toBe(204);
     expect(currentUser.statusCode).toBe(401);
+    await server.close();
+  });
+});
+
+describe("security hardening", () => {
+  it("sets protective security headers on responses", async () => {
+    const server = buildServer({ query: vi.fn() }, await createAuthStore(), { disableLogging: true });
+    const response = await server.inject({ method: "GET", url: "/health" });
+
+    expect(response.headers["x-content-type-options"]).toBe("nosniff");
+    expect(response.headers["x-frame-options"]).toBe("DENY");
+    expect(response.headers["referrer-policy"]).toBe("no-referrer");
+    expect(response.headers["cache-control"]).toBe("no-store");
+    expect(response.headers["content-security-policy"]).toContain("default-src 'none'");
+    await server.close();
+  });
+
+  it("adds HSTS only when TLS is enabled", async () => {
+    const server = buildServer({ query: vi.fn() }, await createAuthStore(), { disableLogging: true });
+    const response = await server.inject({ method: "GET", url: "/health" });
+    expect(response.headers["strict-transport-security"]).toBeUndefined();
+    await server.close();
+  });
+
+  it("rate limits repeated sign-in attempts from one client", async () => {
+    const store = await createAuthStore();
+    const server = buildServer({ query: vi.fn() }, store, {
+      disableLogging: true,
+      loginRateLimit: { windowMs: 60_000, maxAttempts: 2 },
+    });
+
+    const first = await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: "wrong" } });
+    const second = await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: "wrong" } });
+    const third = await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: "wrong" } });
+
+    expect(first.statusCode).toBe(401);
+    expect(second.statusCode).toBe(401);
+    expect(third.statusCode).toBe(429);
+    expect(third.headers["retry-after"]).toBeDefined();
+    await server.close();
+  });
+
+  it("resets the rate limit window after a successful sign in", async () => {
+    const store = await createAuthStore();
+    const server = buildServer({ query: vi.fn() }, store, {
+      disableLogging: true,
+      loginRateLimit: { windowMs: 60_000, maxAttempts: 1 },
+    });
+
+    const success = await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: testPassword } });
+    expect(success.statusCode).toBe(200);
+    const next = await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: testPassword } });
+    expect(next.statusCode).toBe(200);
+    await server.close();
+  });
+});
+
+describe("audit trail", () => {
+  it("records successful and failed sign-in attempts", async () => {
+    const audit = new MemoryAuditStore();
+    const server = buildServer({ query: vi.fn() }, await createAuthStore(), { disableLogging: true, audit });
+
+    await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: testPassword } });
+    await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: "wrong" } });
+
+    expect(audit.events.map((event) => event.action)).toEqual(
+      expect.arrayContaining(["auth.login", "auth.login_failed"]),
+    );
+    const success = audit.events.find((event) => event.action === "auth.login");
+    expect(success?.actorDisplayName).toBe("Test Owner");
+    expect(success?.ipAddress).toBeDefined();
+    await server.close();
+  });
+
+  it("records user creation with the acting administrator", async () => {
+    const audit = new MemoryAuditStore();
+    const store = await createAuthStore();
+    const server = buildServer({ query: vi.fn() }, store, { disableLogging: true, audit });
+    const login = await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: testPassword } });
+    const token = login.json().token as string;
+
+    await server.inject({
+      method: "POST",
+      url: "/admin/users",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { username: "cashier-2", displayName: "Second Cashier", password: "Long-test-password-123", role: "Cashier" },
+    });
+
+    const event = audit.events.find((entry) => entry.action === "user.create");
+    expect(event).toMatchObject({ entityType: "user", actorDisplayName: "Test Owner" });
+    expect(event?.metadata).toMatchObject({ role: "Cashier" });
+    await server.close();
+  });
+
+  it("exposes the audit trail to authorized viewers and enforces the audit.view permission", async () => {
+    const audit = new MemoryAuditStore();
+    const store = await createAuthStore(["user.manage", "subscriber.view", "audit.view"]);
+    const server = buildServer({ query: vi.fn() }, store, { disableLogging: true, audit });
+    const login = await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: testPassword } });
+    const token = login.json().token as string;
+
+    const response = await server.inject({ method: "GET", url: "/admin/audit", headers: { authorization: `Bearer ${token}` } });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().events.length).toBeGreaterThanOrEqual(1);
+
+    const forbidden = await buildServer({ query: vi.fn() }, await createAuthStore(["subscriber.view"]), { disableLogging: true, audit });
+    const forbiddenLogin = await forbidden.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: testPassword } });
+    const forbiddenResponse = await forbidden.inject({
+      method: "GET",
+      url: "/admin/audit",
+      headers: { authorization: `Bearer ${forbiddenLogin.json().token}` },
+    });
+    expect(forbiddenResponse.statusCode).toBe(403);
+    await server.close();
+    await forbidden.close();
+  });
+
+  it("reports audit unavailability when no store is configured", async () => {
+    const store = await createAuthStore(["user.manage", "audit.view"]);
+    const server = buildServer({ query: vi.fn() }, store, { disableLogging: true });
+    const login = await server.inject({ method: "POST", url: "/auth/login", payload: { username: "owner", password: testPassword } });
+    const response = await server.inject({
+      method: "GET",
+      url: "/admin/audit",
+      headers: { authorization: `Bearer ${login.json().token}` },
+    });
+    expect(response.statusCode).toBe(503);
     await server.close();
   });
 });

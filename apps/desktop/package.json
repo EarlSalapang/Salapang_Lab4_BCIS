@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
     "build": "electron-vite build",
@@ -10,16 +11,18 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json"
   },
   "dependencies": {
+    "exceljs": "^4.4.0",
+    "pdfmake": "^0.3.11",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
   "devDependencies": {
     "@bcis/shared": "0.1.0",
     "@tailwindcss/vite": "^4.0.0",
-    "@vitejs/plugin-react": "^4.0.0",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
     "dotenv": "^16.0.0",
     "electron": "^44.0.0",
     "electron-builder": "^26.0.0",
@@ -31,6 +34,7 @@
   "build": {
     "appId": "ph.bcis.subscription-billing",
     "productName": "BCIS Billing",
+    "electronVersion": "44.6.0",
     "directories": {
       "output": "../../release"
     },

@@ -1,4 +1,4 @@
-import { boolean, check, date, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, date, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 
 export const applicationSettings = pgTable("application_settings", {
@@ -244,6 +244,8 @@ export const payments = pgTable("payments", {
   verifiedAt: timestamp("verified_at", { withTimezone: true }),
   verifiedByUserId: uuid("verified_by_user_id").references(() => users.id, { onDelete: "set null" }),
   createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  collectorId: uuid("collector_id").references(() => collectors.id, { onDelete: "set null" }),
+  collectionBatchId: uuid("collection_batch_id").references(() => collectionBatches.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
@@ -252,6 +254,8 @@ export const payments = pgTable("payments", {
   index("payments_method_idx").on(table.method),
   index("payments_payment_date_idx").on(table.paymentDate),
   index("payments_reference_idx").on(table.referenceNumber),
+  index("payments_collector_idx").on(table.collectorId),
+  index("payments_batch_idx").on(table.collectionBatchId),
   check("payments_amount_check", sql`amount_cents > 0`),
   check("payments_method_check", sql`method IN ('cash', 'gcash', 'bank_transfer', 'cheque', 'other')`),
   check("payments_status_check", sql`status IN ('pending', 'posted', 'reversed', 'rejected')`),
@@ -290,3 +294,128 @@ export const paymentReversals = pgTable("payment_reversals", {
   reversedByUserId: uuid("reversed_by_user_id").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const collectors = pgTable("collectors", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  code: text("code").notNull().unique(),
+  name: text("name").notNull(),
+  contactNumber: text("contact_number"),
+  isActive: boolean("is_active").notNull().default(true),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const collectorAssignments = pgTable("collector_assignments", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  collectorId: uuid("collector_id").notNull().references(() => collectors.id, { onDelete: "restrict" }),
+  subscriberId: uuid("subscriber_id").notNull().references(() => subscribers.id, { onDelete: "cascade" }),
+  collectionAreaId: uuid("collection_area_id").references(() => collectionAreas.id, { onDelete: "set null" }),
+  isActive: boolean("is_active").notNull().default(true),
+  assignedAt: timestamp("assigned_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("collector_assignments_collector_idx").on(table.collectorId),
+  index("collector_assignments_subscriber_idx").on(table.subscriberId),
+  index("collector_assignments_active_idx").on(table.isActive),
+  uniqueIndex("collector_assignments_collector_subscriber_idx").on(table.collectorId, table.subscriberId),
+]);
+
+export const collectionBatches = pgTable("collection_batches", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  batchNumber: text("batch_number").notNull().unique(),
+  collectorId: uuid("collector_id").notNull().references(() => collectors.id, { onDelete: "restrict" }),
+  collectionAreaId: uuid("collection_area_id").references(() => collectionAreas.id, { onDelete: "set null" }),
+  routeDate: date("route_date", { mode: "string" }).notNull(),
+  status: text("status").notNull().default("OPEN"),
+  expectedCents: integer("expected_cents").notNull().default(0),
+  cashCollectedCents: integer("cash_collected_cents").notNull().default(0),
+  nonCashCollectedCents: integer("non_cash_collected_cents").notNull().default(0),
+  remittedCents: integer("remitted_cents"),
+  shortageCents: integer("shortage_cents").notNull().default(0),
+  overageCents: integer("overage_cents").notNull().default(0),
+  notes: text("notes"),
+  openedByUserId: uuid("opened_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  submittedAt: timestamp("submitted_at", { withTimezone: true }),
+  remittedAt: timestamp("remitted_at", { withTimezone: true }),
+  reconciledAt: timestamp("reconciled_at", { withTimezone: true }),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
+  closedByUserId: uuid("closed_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("collection_batches_collector_idx").on(table.collectorId),
+  index("collection_batches_status_idx").on(table.status),
+  index("collection_batches_route_date_idx").on(table.routeDate),
+  check("collection_batches_status_check", sql`status IN ('OPEN', 'IN_PROGRESS', 'SUBMITTED', 'REMITTED', 'RECONCILED', 'CLOSED', 'CANCELLED')`),
+  check("collection_batches_amounts_check", sql`expected_cents >= 0 AND cash_collected_cents >= 0 AND non_cash_collected_cents >= 0`),
+]);
+
+export const batchAccounts = pgTable("batch_accounts", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  batchId: uuid("batch_id").notNull().references(() => collectionBatches.id, { onDelete: "cascade" }),
+  subscriberId: uuid("subscriber_id").notNull().references(() => subscribers.id, { onDelete: "cascade" }),
+  currentBillCents: integer("current_bill_cents").notNull().default(0),
+  arrearsCents: integer("arrears_cents").notNull().default(0),
+  expectedCents: integer("expected_cents").notNull().default(0),
+  collectedCents: integer("collected_cents").notNull().default(0),
+  status: text("status").notNull().default("PENDING"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("batch_accounts_batch_idx").on(table.batchId),
+  index("batch_accounts_subscriber_idx").on(table.subscriberId),
+  uniqueIndex("batch_accounts_batch_subscriber_idx").on(table.batchId, table.subscriberId),
+  check("batch_accounts_status_check", sql`status IN ('PENDING', 'PARTIAL', 'COLLECTED', 'SKIPPED')`),
+]);
+
+export const collectorRemittances = pgTable("collector_remittances", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  batchId: uuid("batch_id").notNull().references(() => collectionBatches.id, { onDelete: "cascade" }),
+  amountCents: integer("amount_cents").notNull(),
+  referenceNumber: text("reference_number"),
+  notes: text("notes"),
+  recordedByUserId: uuid("recorded_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("collector_remittances_batch_idx").on(table.batchId),
+  uniqueIndex("collector_remittances_batch_unique_idx").on(table.batchId),
+  check("collector_remittances_amount_check", sql`amount_cents >= 0`),
+]);
+
+export const auditEvents = pgTable("audit_events", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull().defaultNow(),
+  actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+  actorDisplayName: text("actor_display_name").notNull(),
+  action: text("action").notNull(),
+  entityType: text("entity_type"),
+  entityId: text("entity_id"),
+  summary: text("summary").notNull(),
+  metadata: jsonb("metadata"),
+  ipAddress: text("ip_address"),
+  userAgent: text("user_agent"),
+}, (table) => [
+  index("audit_events_occurred_at_idx").on(table.occurredAt),
+  index("audit_events_action_idx").on(table.action),
+  index("audit_events_actor_idx").on(table.actorUserId),
+  index("audit_events_entity_idx").on(table.entityType, table.entityId),
+]);
+
+export const serviceSuspensions = pgTable("service_suspensions", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  serviceAccountId: uuid("service_account_id").notNull().references(() => serviceAccounts.id, { onDelete: "cascade" }),
+  subscriberId: uuid("subscriber_id").notNull().references(() => subscribers.id, { onDelete: "cascade" }),
+  reason: text("reason"),
+  notes: text("notes"),
+  suspendedAt: timestamp("suspended_at", { withTimezone: true }).notNull().defaultNow(),
+  suspendedByUserId: uuid("suspended_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  reconnectedAt: timestamp("reconnected_at", { withTimezone: true }),
+  reconnectedByUserId: uuid("reconnected_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  reconnectionReason: text("reconnection_reason"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("service_suspensions_account_idx").on(table.serviceAccountId),
+  index("service_suspensions_subscriber_idx").on(table.subscriberId),
+  index("service_suspensions_reconnected_idx").on(table.reconnectedAt),
+]);

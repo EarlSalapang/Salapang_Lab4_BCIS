@@ -18,7 +18,11 @@
     "test": "npm run test --workspaces --if-present",
     "db:generate": "npm run db:generate --workspace @bcis/api",
     "db:migrate": "npm run db:migrate --workspace @bcis/api",
-    "db:seed-admin": "npm run db:seed-admin --workspace @bcis/api"
+    "db:seed-admin": "npm run db:seed-admin --workspace @bcis/api",
+    "db:seed-demo": "npm run db:seed-demo --workspace @bcis/api",
+    "db:integrity": "npm run db:integrity --workspace @bcis/api",
+    "db:backup": "npm run db:backup --workspace @bcis/api",
+    "db:restore": "npm run db:restore --workspace @bcis/api"
   },
   "devDependencies": {
     "@eslint/js": "^9.0.0",

@@ -105,6 +105,16 @@ try {
        SELECT $1, id FROM roles WHERE name = $2`,
       [user.rows[0]!.id, "Owner / Super Admin"],
     );
+    await client.query(
+      `INSERT INTO audit_events (actor_user_id, actor_display_name, action, entity_type, entity_id, summary, metadata)
+       VALUES ($1, 'System (CLI)', 'user.bootstrap', 'user', $2, $3, $4)`,
+      [
+        user.rows[0]!.id,
+        user.rows[0]!.id,
+        `Bootstrapped the initial owner account "${usernameInput}".`,
+        JSON.stringify({ username: usernameInput }),
+      ],
+    );
     await client.query("COMMIT");
     console.info(`Initial administrator "${usernameInput}" created. Remove the bootstrap credentials from the environment.`);
   } else {

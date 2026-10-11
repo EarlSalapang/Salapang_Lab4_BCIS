@@ -2,8 +2,18 @@ import { randomUUID } from "node:crypto";
 import type {
   AllocationPreview,
   AllocationPreviewInput,
+  BatchAccount,
   CollectionArea,
+  CollectionBatch,
+  CollectionBatchListQuery,
+  CollectionBatchListResponse,
+  Collector,
+  CollectorAssignment,
+  CollectorReport,
   CreateCollectionAreaInput,
+  CreateCollectorAssignmentInput,
+  CreateCollectionBatchInput,
+  CreateCollectorInput,
   CreateInvoiceInput,
   CreatePaymentInput,
   CreatePlanInput,
@@ -20,7 +30,10 @@ import type {
   Payment,
   PaymentListQuery,
   PaymentListResponse,
+  ReconcileCollectionBatchInput,
+  RemitCollectionBatchInput,
   ReversePaymentInput,
+  RouteSheet,
   ServiceAccountDetail,
   ServiceAccountListQuery,
   ServiceAccountListResponse,
@@ -30,15 +43,33 @@ import type {
   SubscriberListQuery,
   SubscriberListResponse,
   SubscriberSummary,
+  UpdateCollectorInput,
   UpdateInvoiceInput,
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
   VerifyPaymentInput,
+  AgingReport,
+  AgingReportRow,
+  OverdueList,
+  OverdueInvoice,
+  SuspensionList,
+  SuspensionCandidate,
+  ServiceSuspension,
+  SuspendServiceAccountInput,
+  ReconnectServiceAccountInput,
+  BillingGenerationResult,
 } from "@bcis/shared";
 
 import type { AuthStore } from "../auth/types.js";
-import { conflict, invalidRequest, notFound, type BillingGenerationResult, type DirectoryActor, type DirectoryStore } from "./types.js";
+import {
+  AGING_BUCKET_DEFINITIONS,
+  bucketIndexForDays,
+  daysOverdue,
+  emptyAgingBuckets,
+  OPEN_INVOICE_STATUSES,
+} from "./receivables.js";
+import { conflict, invalidRequest, notFound,  type DirectoryActor, type DirectoryStore, type DateRange, type InvoiceFact, type PaymentFact, type LedgerFact } from "./types.js";
 
 export class MemoryDirectoryStore implements DirectoryStore {
   private readonly plans = new Map<string, ServicePlan>();
@@ -49,6 +80,11 @@ export class MemoryDirectoryStore implements DirectoryStore {
   private readonly invoices = new Map<string, Invoice>();
   private readonly ledgerEntries: LedgerEntry[] = [];
   private readonly payments = new Map<string, Payment>();
+  private readonly collectors = new Map<string, Collector>();
+  private readonly collectorAssignments = new Map<string, CollectorAssignment>();
+  private readonly batches = new Map<string, CollectionBatch>();
+  private readonly batchAccountsById = new Map<string, BatchAccount[]>();
+  private readonly suspensions: ServiceSuspension[] = [];
 
   private nextNumber(name: string, prefix: string): string {
     const value = (this.counters.get(name) ?? 0) + 1;
@@ -558,6 +594,21 @@ export class MemoryDirectoryStore implements DirectoryStore {
     if (input.method === "gcash" && input.referenceNumber) {
       this.assertUniqueGcashReference(input.referenceNumber, null);
     }
+    let collectorId: string | null = null;
+    let batchId: string | null = null;
+    if (input.collectionBatchId) {
+      const batch = this.batches.get(input.collectionBatchId);
+      if (!batch) throw invalidRequest("The selected collection batch is unavailable.");
+      if (!["OPEN", "IN_PROGRESS"].includes(batch.status)) {
+        throw conflict("Payments can only be recorded against an open or in-progress collection batch.");
+      }
+      const inBatch = (this.batchAccountsById.get(batch.id) ?? []).some(
+        (account) => account.subscriberId === input.subscriberId,
+      );
+      if (!inBatch) throw invalidRequest("The subscriber is not part of the selected collection batch.");
+      collectorId = batch.collectorId;
+      batchId = batch.id;
+    }
     const now = this.now();
     const id = randomUUID();
     const status = input.method === "gcash" ? "pending" : "posted";
@@ -579,6 +630,8 @@ export class MemoryDirectoryStore implements DirectoryStore {
       verifiedAt: null,
       verifiedByUserId: null,
       createdByUserId: actor.userId,
+      collectorId,
+      collectionBatchId: batchId,
       createdAt: now,
       updatedAt: now,
       allocations: [],
@@ -596,6 +649,7 @@ export class MemoryDirectoryStore implements DirectoryStore {
     this.payments.set(payment.id, payment);
     if (payment.status === "posted") {
       this.allocatePaymentRecord(payment, actor);
+      if (batchId) this.applyPaymentToBatch(batchId, input.subscriberId, input.amountCents, input.method);
     }
     return structuredClone(payment);
   }
@@ -611,6 +665,9 @@ export class MemoryDirectoryStore implements DirectoryStore {
       if (payment.referenceNumber) this.assertUniqueGcashReference(payment.referenceNumber, id);
       payment.status = "posted";
       this.allocatePaymentRecord(payment, actor);
+      if (payment.collectionBatchId) {
+        this.applyPaymentToBatch(payment.collectionBatchId, payment.subscriberId, payment.amountCents, payment.method);
+      }
       payment.updatedAt = this.now();
     }
     payment.verificationNote = input.note ?? null;
@@ -635,6 +692,14 @@ export class MemoryDirectoryStore implements DirectoryStore {
     payment.allocations = [];
     payment.allocatedCents = 0;
     payment.unallocatedCents = payment.amountCents;
+    if (payment.collectionBatchId) {
+      this.reversePaymentFromBatch(
+        payment.collectionBatchId,
+        payment.subscriberId,
+        payment.amountCents,
+        payment.method,
+      );
+    }
     payment.status = "reversed";
     payment.updatedAt = this.now();
     payment.reversal = {
@@ -773,6 +838,576 @@ export class MemoryDirectoryStore implements DirectoryStore {
       createdByUserId: actor.userId,
       createdAt: this.now(),
     });
+  }
+
+  async listCollectors(includeInactive: boolean): Promise<Collector[]> {
+    return [...this.collectors.values()]
+      .filter((collector) => includeInactive || collector.isActive)
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((collector) => structuredClone(collector));
+  }
+
+  async createCollector(input: CreateCollectorInput): Promise<Collector> {
+    if ([...this.collectors.values()].some((collector) => collector.code === input.code)) {
+      throw conflict("A collector with that code already exists.");
+    }
+    const now = this.now();
+    const collector: Collector = {
+      id: randomUUID(),
+      code: input.code,
+      name: input.name,
+      contactNumber: input.contactNumber ?? null,
+      isActive: true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.collectors.set(collector.id, collector);
+    return structuredClone(collector);
+  }
+
+  async updateCollector(id: string, input: UpdateCollectorInput): Promise<Collector> {
+    const collector = this.collectors.get(id);
+    if (!collector) throw notFound("Collector");
+    const updated: Collector = {
+      ...collector,
+      name: input.name ?? collector.name,
+      contactNumber: input.contactNumber !== undefined ? input.contactNumber ?? null : collector.contactNumber,
+      isActive: input.isActive ?? collector.isActive,
+      updatedAt: this.now(),
+    };
+    this.collectors.set(id, updated);
+    return structuredClone(updated);
+  }
+
+  async listCollectorAssignments(collectorId?: string): Promise<CollectorAssignment[]> {
+    return [...this.collectorAssignments.values()]
+      .filter((assignment) => !collectorId || assignment.collectorId === collectorId)
+      .map((assignment) => structuredClone(assignment))
+      .sort((left, right) =>
+        left.collectorName.localeCompare(right.collectorName)
+        || left.subscriberAccountNumber.localeCompare(right.subscriberAccountNumber));
+  }
+
+  async createCollectorAssignments(input: CreateCollectorAssignmentInput): Promise<CollectorAssignment[]> {
+    const collector = this.collectors.get(input.collectorId);
+    if (!collector || !collector.isActive) throw invalidRequest("The selected collector is unavailable.");
+    const area = input.collectionAreaId ? this.areas.get(input.collectionAreaId) : undefined;
+    if (input.collectionAreaId && (!area || !area.isActive)) {
+      throw invalidRequest("The selected collection area is unavailable.");
+    }
+    for (const subscriberId of input.subscriberIds) {
+      const subscriber = this.subscribers.get(subscriberId);
+      if (!subscriber) throw invalidRequest("The selected subscriber is unavailable.");
+      const existing = [...this.collectorAssignments.values()].find(
+        (assignment) => assignment.collectorId === input.collectorId && assignment.subscriberId === subscriberId,
+      );
+      const now = this.now();
+      if (existing) {
+        existing.collectionAreaId = input.collectionAreaId ?? null;
+        existing.collectionAreaName = area?.name ?? null;
+        existing.isActive = true;
+        existing.assignedAt = now;
+        continue;
+      }
+      const assignment: CollectorAssignment = {
+        id: randomUUID(),
+        collectorId: input.collectorId,
+        collectorName: collector.name,
+        subscriberId,
+        subscriberAccountNumber: subscriber.accountNumber,
+        subscriberName: subscriber.displayName,
+        collectionAreaId: input.collectionAreaId ?? null,
+        collectionAreaName: area?.name ?? null,
+        isActive: true,
+        assignedAt: now,
+      };
+      this.collectorAssignments.set(assignment.id, assignment);
+    }
+    return this.listCollectorAssignments(input.collectorId);
+  }
+
+  async removeCollectorAssignment(id: string): Promise<void> {
+    if (!this.collectorAssignments.delete(id)) throw notFound("Collector assignment");
+  }
+
+  async listCollectionBatches(query: CollectionBatchListQuery): Promise<CollectionBatchListResponse> {
+    const matches = [...this.batches.values()]
+      .filter((batch) => !query.collectorId || batch.collectorId === query.collectorId)
+      .filter((batch) => !query.status || batch.status === query.status)
+      .filter((batch) => !query.from || batch.routeDate >= query.from)
+      .filter((batch) => !query.to || batch.routeDate <= query.to)
+      .sort((left, right) => right.routeDate.localeCompare(left.routeDate) || right.createdAt.localeCompare(left.createdAt));
+    const start = (query.page - 1) * query.pageSize;
+    return {
+      batches: matches.slice(start, start + query.pageSize).map((batch) => this.cloneBatch(batch.id)),
+      total: matches.length,
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
+  async getCollectionBatch(id: string): Promise<CollectionBatch> {
+    return this.cloneBatch(id);
+  }
+
+  async createCollectionBatch(input: CreateCollectionBatchInput, actor: DirectoryActor): Promise<CollectionBatch> {
+    const collector = this.collectors.get(input.collectorId);
+    if (!collector || !collector.isActive) throw invalidRequest("The selected collector is unavailable.");
+    const area = input.collectionAreaId ? this.areas.get(input.collectionAreaId) : undefined;
+    if (input.collectionAreaId && (!area || !area.isActive)) {
+      throw invalidRequest("The selected collection area is unavailable.");
+    }
+    const now = this.now();
+    const id = randomUUID();
+    const accounts: BatchAccount[] = [];
+    const assignments = [...this.collectorAssignments.values()].filter(
+      (assignment) =>
+        assignment.collectorId === input.collectorId
+        && assignment.isActive
+        && (!input.collectionAreaId || assignment.collectionAreaId === input.collectionAreaId),
+    );
+    for (const assignment of assignments) {
+      const balances = this.invoicesForSubscriber(assignment.subscriberId);
+      const arrears = balances
+        .filter((invoice) => invoice.dueDate < input.routeDate)
+        .reduce((sum, invoice) => sum + invoice.balanceCents, 0);
+      const current = balances
+        .filter((invoice) => invoice.dueDate >= input.routeDate)
+        .reduce((sum, invoice) => sum + invoice.balanceCents, 0);
+      accounts.push({
+        id: randomUUID(),
+        batchId: id,
+        subscriberId: assignment.subscriberId,
+        subscriberAccountNumber: assignment.subscriberAccountNumber,
+        subscriberName: assignment.subscriberName,
+        addressLine: null,
+        currentBillCents: current,
+        arrearsCents: arrears,
+        expectedCents: current + arrears,
+        collectedCents: 0,
+        status: "PENDING",
+      });
+    }
+    const batch: CollectionBatch = {
+      id,
+      batchNumber: this.nextNumber("collection_batch", "BATCH-"),
+      collectorId: input.collectorId,
+      collectorName: collector.name,
+      collectionAreaId: input.collectionAreaId ?? null,
+      collectionAreaName: area?.name ?? null,
+      routeDate: input.routeDate,
+      status: "OPEN",
+      expectedCents: accounts.reduce((sum, account) => sum + account.expectedCents, 0),
+      cashCollectedCents: 0,
+      nonCashCollectedCents: 0,
+      collectedCents: 0,
+      remittedCents: null,
+      differenceCents: null,
+      shortageCents: 0,
+      overageCents: 0,
+      notes: input.notes ?? null,
+      openedByUserId: actor.userId,
+      submittedAt: null,
+      remittedAt: null,
+      reconciledAt: null,
+      closedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.batches.set(id, batch);
+    this.batchAccountsById.set(id, accounts);
+    return this.cloneBatch(id);
+  }
+
+  async startCollectionBatch(id: string, _actor: DirectoryActor): Promise<CollectionBatch> {
+    const batch = this.batches.get(id);
+    if (!batch) throw notFound("Collection batch");
+    if (batch.status !== "OPEN") throw conflict("Only an OPEN batch can be started.");
+    batch.status = "IN_PROGRESS";
+    batch.updatedAt = this.now();
+    return this.cloneBatch(id);
+  }
+
+  async submitCollectionBatch(id: string, _actor: DirectoryActor): Promise<CollectionBatch> {
+    const batch = this.batches.get(id);
+    if (!batch) throw notFound("Collection batch");
+    if (batch.status !== "IN_PROGRESS") throw conflict("Only an in-progress batch can be submitted.");
+    batch.status = "SUBMITTED";
+    batch.submittedAt = this.now();
+    batch.updatedAt = this.now();
+    return this.cloneBatch(id);
+  }
+
+  async remitCollectionBatch(
+    id: string,
+    input: RemitCollectionBatchInput,
+    _actor: DirectoryActor,
+  ): Promise<CollectionBatch> {
+    const batch = this.batches.get(id);
+    if (!batch) throw notFound("Collection batch");
+    if (batch.status !== "SUBMITTED") throw conflict("Only a submitted batch can be remitted.");
+    const difference = batch.collectedCents - input.amountCents;
+    batch.status = "REMITTED";
+    batch.remittedCents = input.amountCents;
+    batch.differenceCents = difference;
+    batch.shortageCents = Math.max(difference, 0);
+    batch.overageCents = Math.max(-difference, 0);
+    batch.remittedAt = this.now();
+    batch.updatedAt = this.now();
+    if (input.notes) batch.notes = [batch.notes, input.notes].filter(Boolean).join(" | ") || null;
+    return this.cloneBatch(id);
+  }
+
+  async reconcileCollectionBatch(
+    id: string,
+    input: ReconcileCollectionBatchInput,
+    _actor: DirectoryActor,
+  ): Promise<CollectionBatch> {
+    const batch = this.batches.get(id);
+    if (!batch) throw notFound("Collection batch");
+    if (batch.status !== "REMITTED") throw conflict("Only a remitted batch can be reconciled.");
+    batch.status = "RECONCILED";
+    batch.reconciledAt = this.now();
+    batch.updatedAt = this.now();
+    if (input.note) batch.notes = [batch.notes, input.note].filter(Boolean).join(" | ") || null;
+    return this.cloneBatch(id);
+  }
+
+  async closeCollectionBatch(id: string, actor: DirectoryActor): Promise<CollectionBatch> {
+    const batch = this.batches.get(id);
+    if (!batch) throw notFound("Collection batch");
+    if (batch.status !== "RECONCILED") throw conflict("Only a reconciled batch can be closed.");
+    batch.status = "CLOSED";
+    batch.closedAt = this.now();
+    batch.updatedAt = this.now();
+    void actor;
+    return this.cloneBatch(id);
+  }
+
+  async getRouteSheet(id: string): Promise<RouteSheet> {
+    const batch = await this.getCollectionBatch(id);
+    return { batch, accounts: batch.accounts ?? [] };
+  }
+
+  async getCollectorReport(from?: string, to?: string): Promise<CollectorReport> {
+    const rows = [...this.collectors.values()].map((collector) => {
+      const batches = [...this.batches.values()]
+        .filter((batch) => batch.collectorId === collector.id)
+        .filter((batch) => !from || batch.routeDate >= from)
+        .filter((batch) => !to || batch.routeDate <= to);
+      return {
+        collectorId: collector.id,
+        collectorName: collector.name,
+        batches: batches.length,
+        expectedCents: batches.reduce((sum, batch) => sum + batch.expectedCents, 0),
+        collectedCents: batches.reduce((sum, batch) => sum + batch.collectedCents, 0),
+        remittedCents: batches.reduce((sum, batch) => sum + (batch.remittedCents ?? 0), 0),
+        shortageCents: batches.reduce((sum, batch) => sum + batch.shortageCents, 0),
+        overageCents: batches.reduce((sum, batch) => sum + batch.overageCents, 0),
+      };
+    });
+    return { from: from ?? null, to: to ?? null, rows };
+  }
+
+  async getAgingReport(asOf?: string): Promise<AgingReport> {
+    const reference = asOf ?? this.now().slice(0, 10);
+    const rowsBySubscriber = new Map<string, AgingReportRow>();
+    for (const invoice of this.openInvoices()) {
+      const subscriber = this.subscribers.get(invoice.subscriberId);
+      if (!subscriber) continue;
+      let row = rowsBySubscriber.get(invoice.subscriberId);
+      if (!row) {
+        row = {
+          subscriberId: subscriber.id,
+          subscriberAccountNumber: subscriber.accountNumber,
+          subscriberName: subscriber.displayName,
+          totalBalanceCents: 0,
+          currentCents: 0,
+          buckets: emptyAgingBuckets(),
+        };
+        rowsBySubscriber.set(invoice.subscriberId, row);
+      }
+      row.totalBalanceCents += invoice.balanceCents;
+      const overdueDays = daysOverdue(invoice.dueDate, reference);
+      if (overdueDays <= 0) {
+        row.currentCents += invoice.balanceCents;
+        continue;
+      }
+      const bucket = row.buckets[bucketIndexForDays(overdueDays)]!;
+      bucket.amountCents += invoice.balanceCents;
+      bucket.count += 1;
+    }
+    const rows = [...rowsBySubscriber.values()].sort(
+      (left, right) => right.totalBalanceCents - left.totalBalanceCents,
+    );
+    return {
+      asOf: reference,
+      buckets: AGING_BUCKET_DEFINITIONS.map(({ label, minDays, maxDays }) => ({ label, minDays, maxDays })),
+      rows,
+      totals: {
+        totalBalanceCents: rows.reduce((sum, row) => sum + row.totalBalanceCents, 0),
+        currentCents: rows.reduce((sum, row) => sum + row.currentCents, 0),
+      },
+    };
+  }
+
+  async getOverdueInvoices(asOf?: string): Promise<OverdueList> {
+    const reference = asOf ?? this.now().slice(0, 10);
+    const invoices: OverdueInvoice[] = [];
+    for (const invoice of this.openInvoices()) {
+      const overdueDays = daysOverdue(invoice.dueDate, reference);
+      if (overdueDays <= 0) continue;
+      const subscriber = this.subscribers.get(invoice.subscriberId);
+      if (!subscriber) continue;
+      invoices.push({
+        id: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        subscriberId: subscriber.id,
+        subscriberAccountNumber: subscriber.accountNumber,
+        subscriberName: subscriber.displayName,
+        dueDate: invoice.dueDate,
+        issueDate: invoice.issueDate,
+        totalCents: invoice.totalCents,
+        amountPaidCents: invoice.amountPaidCents,
+        balanceCents: invoice.balanceCents,
+        daysOverdue: overdueDays,
+        status: invoice.status,
+      });
+    }
+    invoices.sort((left, right) =>
+      right.daysOverdue - left.daysOverdue || left.dueDate.localeCompare(right.dueDate),
+    );
+    return {
+      asOf: reference,
+      invoices,
+      totalBalanceCents: invoices.reduce((sum, invoice) => sum + invoice.balanceCents, 0),
+      count: invoices.length,
+    };
+  }
+
+  async getSuspensionCandidates(asOf?: string): Promise<SuspensionList> {
+    const reference = asOf ?? this.now().slice(0, 10);
+    const grouped = new Map<string, SuspensionCandidate>();
+    for (const invoice of this.openInvoices()) {
+      if (!invoice.serviceAccountId) continue;
+      const account = this.serviceAccounts.get(invoice.serviceAccountId);
+      if (!account || account.status !== "ACTIVE") continue;
+      const overdueDays = daysOverdue(invoice.dueDate, reference);
+      if (overdueDays <= 0) continue;
+      let candidate = grouped.get(account.id);
+      if (!candidate) {
+        candidate = {
+          subscriberId: account.subscriberId,
+          subscriberAccountNumber: account.subscriberAccountNumber,
+          subscriberName: account.subscriberName,
+          serviceAccountId: account.id,
+          serviceAccountNumber: account.accountNumber,
+          totalOverdueCents: 0,
+          oldestOverdueDays: 0,
+          invoiceCount: 0,
+        };
+        grouped.set(account.id, candidate);
+      }
+      candidate.totalOverdueCents += invoice.balanceCents;
+      candidate.invoiceCount += 1;
+      candidate.oldestOverdueDays = Math.max(candidate.oldestOverdueDays, overdueDays);
+    }
+    const candidates = [...grouped.values()].sort(
+      (left, right) =>
+        right.oldestOverdueDays - left.oldestOverdueDays || right.totalOverdueCents - left.totalOverdueCents,
+    );
+    return { asOf: reference, candidates };
+  }
+
+  async listSuspensions(serviceAccountId?: string): Promise<ServiceSuspension[]> {
+    return this.suspensions
+      .filter((suspension) => !serviceAccountId || suspension.serviceAccountId === serviceAccountId)
+      .map((suspension) => structuredClone(suspension))
+      .sort((left, right) => right.suspendedAt.localeCompare(left.suspendedAt));
+  }
+
+  async suspendServiceAccount(
+    serviceAccountId: string,
+    input: SuspendServiceAccountInput,
+    actor: DirectoryActor,
+  ): Promise<ServiceSuspension> {
+    const account = this.serviceAccounts.get(serviceAccountId);
+    if (!account) throw notFound("Service account");
+    if (account.status === "SUSPENDED") throw conflict("That service account is already suspended.");
+    if (account.status !== "ACTIVE") throw invalidRequest("Only active service accounts can be suspended.");
+    const suspension: ServiceSuspension = {
+      id: randomUUID(),
+      serviceAccountId: account.id,
+      subscriberId: account.subscriberId,
+      reason: input.reason ?? null,
+      notes: input.notes ?? null,
+      suspendedAt: this.now(),
+      suspendedByUserId: actor.userId,
+      reconnectedAt: null,
+      reconnectedByUserId: null,
+      reconnectionReason: null,
+    };
+    this.suspensions.push(suspension);
+    await this.updateServiceAccount(
+      account.id,
+      { status: "SUSPENDED", reason: input.reason ?? "Suspended for non-payment" },
+      actor,
+    );
+    return structuredClone(suspension);
+  }
+
+  async reconnectServiceAccount(
+    serviceAccountId: string,
+    input: ReconnectServiceAccountInput,
+    actor: DirectoryActor,
+  ): Promise<ServiceSuspension> {
+    const account = this.serviceAccounts.get(serviceAccountId);
+    if (!account) throw notFound("Service account");
+    const openSuspension = [...this.suspensions]
+      .reverse()
+      .find((suspension) => suspension.serviceAccountId === serviceAccountId && suspension.reconnectedAt === null);
+    if (account.status !== "SUSPENDED" || !openSuspension) {
+      throw invalidRequest("That service account is not currently suspended.");
+    }
+    openSuspension.reconnectedAt = this.now();
+    openSuspension.reconnectedByUserId = actor.userId;
+    openSuspension.reconnectionReason = input.reason ?? null;
+    await this.updateServiceAccount(
+      account.id,
+      { status: "ACTIVE", reason: input.reason ?? "Reconnected after payment" },
+      actor,
+    );
+    return structuredClone(openSuspension);
+  }
+
+  async listInvoiceFacts(filter: DateRange): Promise<InvoiceFact[]> {
+    const facts: InvoiceFact[] = [];
+    for (const invoice of this.invoices.values()) {
+      if (filter.from && invoice.issueDate < filter.from) continue;
+      if (filter.to && invoice.issueDate > filter.to) continue;
+      const subscriber = this.subscribers.get(invoice.subscriberId);
+      const account = invoice.serviceAccountId ? this.serviceAccounts.get(invoice.serviceAccountId) : undefined;
+      facts.push({
+        id: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        subscriberId: invoice.subscriberId,
+        subscriberAccountNumber: subscriber?.accountNumber ?? "",
+        subscriberName: subscriber?.displayName ?? "",
+        serviceAccountId: invoice.serviceAccountId ?? null,
+        planName: account?.planName ?? null,
+        serviceType: account?.serviceType ?? null,
+        collectionAreaName: account?.collectionAreaName ?? null,
+        issueDate: invoice.issueDate,
+        dueDate: invoice.dueDate,
+        totalCents: invoice.totalCents,
+        amountPaidCents: invoice.amountPaidCents,
+        balanceCents: invoice.balanceCents,
+        status: invoice.status,
+      });
+    }
+    return facts;
+  }
+
+  async listPaymentFacts(filter: DateRange): Promise<PaymentFact[]> {
+    return [...this.payments.values()]
+      .filter((payment) => !filter.from || payment.paymentDate.slice(0, 10) >= filter.from)
+      .filter((payment) => !filter.to || payment.paymentDate.slice(0, 10) <= filter.to)
+      .map((payment) => ({
+        id: payment.id,
+        receiptNumber: payment.receiptNumber,
+        subscriberId: payment.subscriberId,
+        subscriberAccountNumber: payment.subscriberAccountNumber,
+        subscriberName: payment.subscriberName,
+        method: payment.method,
+        status: payment.status,
+        amountCents: payment.amountCents,
+        paymentDate: payment.paymentDate,
+        collectorId: payment.collectorId ?? null,
+        collectionBatchId: payment.collectionBatchId ?? null,
+      }));
+  }
+
+  async listSubscriberRows(): Promise<SubscriberSummary[]> {
+    return [...this.subscribers.values()].map(
+      ({ notes: _notes, addresses: _addresses, serviceAccounts: _serviceAccounts, ...summary }) =>
+        structuredClone(summary),
+    );
+  }
+
+  async listLedgerFacts(filter: { subscriberId?: string } & DateRange): Promise<LedgerFact[]> {
+    return this.ledgerEntries
+      .filter((entry) => !filter.subscriberId || entry.subscriberId === filter.subscriberId)
+      .map((entry) => ({
+        id: entry.id,
+        subscriberId: entry.subscriberId,
+        serviceAccountId: entry.serviceAccountId ?? null,
+        invoiceId: entry.invoiceId ?? null,
+        entryDate: entry.entryDate,
+        entryType: entry.entryType,
+        sourceType: entry.sourceType,
+        amountCents: entry.amountCents,
+        balanceCents: entry.balanceCents,
+        description: entry.description,
+        createdAt: entry.createdAt,
+      }));
+  }
+
+  private openInvoices(): Invoice[] {
+    return [...this.invoices.values()].filter(
+      (invoice) =>
+        (OPEN_INVOICE_STATUSES as readonly string[]).includes(invoice.status) && invoice.balanceCents > 0,
+    );
+  }
+
+  private cloneBatch(id: string): CollectionBatch {
+    const batch = this.batches.get(id);
+    if (!batch) throw notFound("Collection batch");
+    return { ...structuredClone(batch), accounts: structuredClone(this.batchAccountsById.get(id) ?? []) };
+  }
+
+  private invoicesForSubscriber(subscriberId: string): Invoice[] {
+    return [...this.invoices.values()].filter(
+      (invoice) =>
+        invoice.subscriberId === subscriberId
+        && ["posted", "partially_paid", "overdue"].includes(invoice.status)
+        && invoice.balanceCents > 0,
+    );
+  }
+
+  private applyPaymentToBatch(batchId: string, subscriberId: string, amountCents: number, method: string): void {
+    const batch = this.batches.get(batchId);
+    if (!batch) return;
+    if (method === "cash") batch.cashCollectedCents += amountCents;
+    else batch.nonCashCollectedCents += amountCents;
+    batch.collectedCents = batch.cashCollectedCents + batch.nonCashCollectedCents;
+    const account = (this.batchAccountsById.get(batchId) ?? []).find((entry) => entry.subscriberId === subscriberId);
+    if (account) {
+      account.collectedCents += amountCents;
+      account.status = account.expectedCents > 0 && account.collectedCents >= account.expectedCents
+        ? "COLLECTED"
+        : account.collectedCents > 0
+          ? "PARTIAL"
+          : account.status;
+    }
+    batch.updatedAt = this.now();
+  }
+
+  private reversePaymentFromBatch(batchId: string, subscriberId: string, amountCents: number, method: string): void {
+    const batch = this.batches.get(batchId);
+    if (!batch) return;
+    if (method === "cash") batch.cashCollectedCents = Math.max(batch.cashCollectedCents - amountCents, 0);
+    else batch.nonCashCollectedCents = Math.max(batch.nonCashCollectedCents - amountCents, 0);
+    batch.collectedCents = batch.cashCollectedCents + batch.nonCashCollectedCents;
+    const account = (this.batchAccountsById.get(batchId) ?? []).find((entry) => entry.subscriberId === subscriberId);
+    if (account) {
+      account.collectedCents = Math.max(account.collectedCents - amountCents, 0);
+      account.status = account.expectedCents > 0 && account.collectedCents >= account.expectedCents
+        ? "COLLECTED"
+        : account.collectedCents > 0
+          ? "PARTIAL"
+          : "PENDING";
+    }
+    batch.updatedAt = this.now();
   }
 
   private buildInvoice(fields: {

@@ -1,6 +1,6 @@
 import { z } from "zod";
-
 export * from "./catalog.js";
+export * from "./reports.js";
 
 export const apiHealthSchema = z.object({
   status: z.literal("ok"),

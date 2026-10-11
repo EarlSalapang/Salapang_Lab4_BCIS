@@ -1,8 +1,20 @@
+export type { AgingReport, OverdueList, SuspensionList, ServiceSuspension, SuspendServiceAccountInput, ReconnectServiceAccountInput, BillingGenerationResult } from "@bcis/shared";
+export type { DateRange, InvoiceFact, PaymentFact, LedgerFact, ReportDataSource } from "../reports/types.js";
+import type { DateRange, InvoiceFact, PaymentFact, LedgerFact } from "../reports/types.js";
 import type {
   AllocationPreview,
   AllocationPreviewInput,
   CollectionArea,
+  CollectionBatch,
+  CollectionBatchListQuery,
+  CollectionBatchListResponse,
+  Collector,
+  CollectorAssignment,
+  CollectorReport,
   CreateCollectionAreaInput,
+  CreateCollectorAssignmentInput,
+  CreateCollectionBatchInput,
+  CreateCollectorInput,
   CreateInvoiceInput,
   CreatePaymentInput,
   CreatePlanInput,
@@ -17,7 +29,10 @@ import type {
   Payment,
   PaymentListQuery,
   PaymentListResponse,
+  ReconcileCollectionBatchInput,
+  RemitCollectionBatchInput,
   ReversePaymentInput,
+  RouteSheet,
   ServiceAccountDetail,
   ServiceAccountListQuery,
   ServiceAccountListResponse,
@@ -25,11 +40,19 @@ import type {
   SubscriberDetail,
   SubscriberListQuery,
   SubscriberListResponse,
+  UpdateCollectorInput,
   UpdateInvoiceInput,
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
   VerifyPaymentInput,
+  AgingReport,
+  OverdueList,
+  SuspensionList,
+  ServiceSuspension,
+  SuspendServiceAccountInput,
+  ReconnectServiceAccountInput,
+  BillingGenerationResult,
 } from "@bcis/shared";
 
 export class CatalogError extends Error {
@@ -73,15 +96,44 @@ listInvoices(query: InvoiceListQuery): Promise<InvoiceListResponse>;
   generateInvoices(input: GenerateBillingInput, actor: DirectoryActor): Promise<BillingGenerationResult>;
   listLedgerEntries(query: LedgerEntryListQuery): Promise<LedgerEntryListResponse>;
 
-  previewAllocation(input: AllocationPreviewInput): Promise<AllocationPreview>;
+previewAllocation(input: AllocationPreviewInput): Promise<AllocationPreview>;
   listPayments(query: PaymentListQuery): Promise<PaymentListResponse>;
   getPayment(id: string): Promise<Payment | null>;
   createPayment(input: CreatePaymentInput, actor: DirectoryActor): Promise<Payment>;
   verifyPayment(id: string, input: VerifyPaymentInput, actor: DirectoryActor): Promise<Payment>;
   reversePayment(id: string, input: ReversePaymentInput, actor: DirectoryActor): Promise<Payment>;
-}
 
-export interface BillingGenerationResult {
-  created: Invoice[];
-  skipped: number;
+  listCollectors(includeInactive: boolean): Promise<Collector[]>;
+  createCollector(input: CreateCollectorInput): Promise<Collector>;
+  updateCollector(id: string, input: UpdateCollectorInput): Promise<Collector>;
+
+  listCollectorAssignments(collectorId?: string): Promise<CollectorAssignment[]>;
+  createCollectorAssignments(input: CreateCollectorAssignmentInput): Promise<CollectorAssignment[]>;
+  removeCollectorAssignment(id: string): Promise<void>;
+
+  listCollectionBatches(query: CollectionBatchListQuery): Promise<CollectionBatchListResponse>;
+  getCollectionBatch(id: string): Promise<CollectionBatch>;
+  createCollectionBatch(input: CreateCollectionBatchInput, actor: DirectoryActor): Promise<CollectionBatch>;
+  startCollectionBatch(id: string, actor: DirectoryActor): Promise<CollectionBatch>;
+  submitCollectionBatch(id: string, actor: DirectoryActor): Promise<CollectionBatch>;
+  remitCollectionBatch(id: string, input: RemitCollectionBatchInput, actor: DirectoryActor): Promise<CollectionBatch>;
+  reconcileCollectionBatch(
+    id: string,
+    input: ReconcileCollectionBatchInput,
+    actor: DirectoryActor,
+  ): Promise<CollectionBatch>;
+  closeCollectionBatch(id: string, actor: DirectoryActor): Promise<CollectionBatch>;
+  getRouteSheet(id: string): Promise<RouteSheet>;
+  getCollectorReport(from?: string, to?: string): Promise<CollectorReport>;
+  getAgingReport(asOf?: string): Promise<AgingReport>;
+  getOverdueInvoices(asOf?: string, pageSize?: number): Promise<OverdueList>;
+  getSuspensionCandidates(asOf?: string): Promise<SuspensionList>;
+  listSuspensions(serviceAccountId?: string): Promise<ServiceSuspension[]>;
+  suspendServiceAccount(id: string, input: SuspendServiceAccountInput, actor: DirectoryActor): Promise<ServiceSuspension>;
+  reconnectServiceAccount(id: string, input: ReconnectServiceAccountInput, actor: DirectoryActor): Promise<ServiceSuspension>;
+
+  listInvoiceFacts(filter: DateRange): Promise<InvoiceFact[]>;
+  listPaymentFacts(filter: DateRange): Promise<PaymentFact[]>;
+  listSubscriberRows(): Promise<import("@bcis/shared").SubscriberSummary[]>;
+  listLedgerFacts(filter: { subscriberId?: string } & DateRange): Promise<LedgerFact[]>;
 }

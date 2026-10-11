@@ -6,8 +6,18 @@ import type { Pool, PoolClient, QueryResultRow } from "pg";
 import type {
   AllocationPreview,
   AllocationPreviewInput,
+  BatchAccount,
   CollectionArea,
+  CollectionBatch,
+  CollectionBatchListQuery,
+  CollectionBatchListResponse,
+  Collector,
+  CollectorAssignment,
+  CollectorReport,
   CreateCollectionAreaInput,
+  CreateCollectorAssignmentInput,
+  CreateCollectionBatchInput,
+  CreateCollectorInput,
   CreateInvoiceInput,
   CreatePaymentInput,
   CreatePlanInput,
@@ -28,7 +38,10 @@ import type {
   PaymentProof,
   PaymentProofInput,
   PaymentReversal,
+  ReconcileCollectionBatchInput,
+  RemitCollectionBatchInput,
   ReversePaymentInput,
+  RouteSheet,
   ServiceAccountDetail,
   ServiceAccountListQuery,
   ServiceAccountListResponse,
@@ -40,14 +53,35 @@ import type {
   SubscriberListQuery,
   SubscriberListResponse,
   SubscriberSummary,
+  UpdateCollectorInput,
   UpdateInvoiceInput,
   UpdatePlanInput,
   UpdateServiceAccountInput,
   UpdateSubscriberInput,
   VerifyPaymentInput,
+  AgingReport,
+  AgingReportRow,
+  OverdueList,
+  SuspensionList,
+  SuspensionCandidate,
+  ServiceSuspension,
+  SuspendServiceAccountInput,
+  ReconnectServiceAccountInput,
+  BillingGenerationResult,
 } from "@bcis/shared";
 
-import { conflict, invalidRequest, notFound, type BillingGenerationResult, type DirectoryActor, type DirectoryStore } from "./types.js";
+import { AGING_BUCKET_DEFINITIONS, bucketIndexForDays, emptyAgingBuckets } from "./receivables.js";
+import {
+  conflict,
+  invalidRequest,
+  notFound,
+  type DirectoryActor,
+  type DirectoryStore,
+  type DateRange,
+  type InvoiceFact,
+  type PaymentFact,
+  type LedgerFact,
+} from "./types.js";
 
 const UNIQUE_VIOLATION = "23505";
 const FOREIGN_KEY_VIOLATION = "23503";
@@ -133,6 +167,65 @@ interface ServiceEventRow extends QueryResultRow {
   changed_by_user_id: string | null;
   changed_by_name: string | null;
   occurred_at: Date;
+}
+
+interface ServiceSuspensionRow extends QueryResultRow {
+  id: string;
+  service_account_id: string;
+  subscriber_id: string;
+  reason: string | null;
+  notes: string | null;
+  suspended_at: Date;
+  suspended_by_user_id: string | null;
+  reconnected_at: Date | null;
+  reconnected_by_user_id: string | null;
+  reconnection_reason: string | null;
+}
+
+interface OpenInvoiceReportRow extends QueryResultRow {
+  subscriber_id: string;
+  account_number: string;
+  first_name: string;
+  middle_name: string | null;
+  last_name: string;
+  service_account_id: string | null;
+  service_account_number: string;
+  balance_cents: number;
+  overdue_days: number;
+}
+
+interface OverdueInvoiceRow extends QueryResultRow {
+  id: string;
+  invoice_number: string;
+  subscriber_id: string;
+  subscriber_account_number: string;
+  subscriber_name: string;
+  issue_date: string;
+  due_date: string;
+  total_cents: number;
+  amount_paid_cents: number;
+  balance_cents: number;
+  status: string;
+  overdue_days: number;
+}
+
+function toServiceSuspension(row: ServiceSuspensionRow): ServiceSuspension {
+  return {
+    id: row.id,
+    serviceAccountId: row.service_account_id,
+    subscriberId: row.subscriber_id,
+    reason: row.reason,
+    notes: row.notes,
+    suspendedAt: row.suspended_at.toISOString(),
+    suspendedByUserId: row.suspended_by_user_id,
+    reconnectedAt: row.reconnected_at ? row.reconnected_at.toISOString() : null,
+    reconnectedByUserId: row.reconnected_by_user_id,
+    reconnectionReason: row.reconnection_reason,
+  };
+}
+
+function formatSubscriberName(firstName: string, middleName: string | null, lastName: string): string {
+  return middleName ? `${lastName}, ${firstName} ${middleName}` : `${lastName}, ${firstName}`;
 }
 
 function toPlan(row: PlanRow): ServicePlan {
@@ -377,6 +470,8 @@ interface PaymentRow extends QueryResultRow {
   verified_at: Date | null;
   verified_by_user_id: string | null;
   created_by_user_id: string | null;
+  collector_id: string | null;
+  collection_batch_id: string | null;
   created_at: Date;
   updated_at: Date;
   subscriber_account_number: string;
@@ -422,6 +517,212 @@ interface AllocatableInvoiceRow extends QueryResultRow {
   balance_cents: number;
   status: string;
 }
+
+interface CollectorRow extends QueryResultRow {
+  id: string;
+  code: string;
+  name: string;
+  contact_number: string | null;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+interface CollectorAssignmentRow extends QueryResultRow {
+  id: string;
+  collector_id: string;
+  collector_name: string;
+  subscriber_id: string;
+  subscriber_account_number: string;
+  subscriber_name: string;
+  collection_area_id: string | null;
+  collection_area_name: string | null;
+  is_active: boolean;
+  assigned_at: Date;
+}
+
+interface CollectionBatchRow extends QueryResultRow {
+  id: string;
+  batch_number: string;
+  collector_id: string;
+  collector_name: string;
+  collection_area_id: string | null;
+  collection_area_name: string | null;
+  route_date: string;
+  status: string;
+  expected_cents: number;
+  cash_collected_cents: number;
+  non_cash_collected_cents: number;
+  remitted_cents: number | null;
+  shortage_cents: number;
+  overage_cents: number;
+  notes: string | null;
+  opened_by_user_id: string | null;
+  submitted_at: Date | null;
+  remitted_at: Date | null;
+  reconciled_at: Date | null;
+  closed_at: Date | null;
+  closed_by_user_id: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+interface BatchAccountRow extends QueryResultRow {
+  id: string;
+  batch_id: string;
+  subscriber_id: string;
+  subscriber_account_number: string;
+  subscriber_name: string;
+  address_line: string | null;
+  current_bill_cents: number;
+  arrears_cents: number;
+  expected_cents: number;
+  collected_cents: number;
+  status: string;
+}
+
+interface CollectorReportRow extends QueryResultRow {
+  collector_id: string;
+  collector_name: string;
+  batches: string;
+  expected_cents: string;
+  collected_cents: string;
+  remitted_cents: string;
+  shortage_cents: string;
+  overage_cents: string;
+}
+
+interface InvoiceFactRow extends QueryResultRow {
+  id: string;
+  invoice_number: string;
+  subscriber_id: string;
+  service_account_id: string | null;
+  issue_date: string;
+  due_date: string;
+  total_cents: number;
+  amount_paid_cents: number;
+  balance_cents: number;
+  status: string;
+  subscriber_account_number: string;
+  subscriber_name: string;
+  plan_name: string | null;
+  service_type: string | null;
+  collection_area_name: string | null;
+}
+
+interface PaymentFactRow extends QueryResultRow {
+  id: string;
+  receipt_number: string;
+  subscriber_id: string;
+  subscriber_account_number: string;
+  subscriber_name: string;
+  amount_cents: number;
+  method: string;
+  status: string;
+  payment_date: Date;
+  collector_id: string | null;
+  collection_batch_id: string | null;
+}
+
+interface LedgerFactRow extends QueryResultRow {
+  id: string;
+  subscriber_id: string;
+  service_account_id: string | null;
+  invoice_id: string | null;
+  entry_date: string;
+  entry_type: string;
+  source_type: string;
+  amount_cents: number;
+  balance_cents: number;
+  description: string;
+  created_at: Date;
+}
+
+function toCollector(row: CollectorRow): Collector {
+  return {
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    contactNumber: row.contact_number,
+    isActive: row.is_active,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+  };
+}
+
+function toCollectorAssignment(row: CollectorAssignmentRow): CollectorAssignment {
+  return {
+    id: row.id,
+    collectorId: row.collector_id,
+    collectorName: row.collector_name,
+    subscriberId: row.subscriber_id,
+    subscriberAccountNumber: row.subscriber_account_number,
+    subscriberName: row.subscriber_name,
+    collectionAreaId: row.collection_area_id,
+    collectionAreaName: row.collection_area_name,
+    isActive: row.is_active,
+    assignedAt: row.assigned_at.toISOString(),
+  };
+}
+
+function toCollectionBatch(row: CollectionBatchRow, accounts?: BatchAccount[]): CollectionBatch {
+  const collectedCents = row.cash_collected_cents + row.non_cash_collected_cents;
+  const remittedCents = row.remitted_cents;
+  return {
+    id: row.id,
+    batchNumber: row.batch_number,
+    collectorId: row.collector_id,
+    collectorName: row.collector_name,
+    collectionAreaId: row.collection_area_id,
+    collectionAreaName: row.collection_area_name,
+    routeDate: row.route_date,
+    status: row.status as CollectionBatch["status"],
+    expectedCents: row.expected_cents,
+    cashCollectedCents: row.cash_collected_cents,
+    nonCashCollectedCents: row.non_cash_collected_cents,
+    collectedCents,
+    remittedCents,
+    differenceCents: remittedCents === null ? null : collectedCents - remittedCents,
+    shortageCents: row.shortage_cents,
+    overageCents: row.overage_cents,
+    notes: row.notes,
+    openedByUserId: row.opened_by_user_id,
+    submittedAt: row.submitted_at ? row.submitted_at.toISOString() : null,
+    remittedAt: row.remitted_at ? row.remitted_at.toISOString() : null,
+    reconciledAt: row.reconciled_at ? row.reconciled_at.toISOString() : null,
+    closedAt: row.closed_at ? row.closed_at.toISOString() : null,
+    createdAt: row.created_at.toISOString(),
+    updatedAt: row.updated_at.toISOString(),
+    accounts,
+  };
+}
+
+function toBatchAccount(row: BatchAccountRow): BatchAccount {
+  return {
+    id: row.id,
+    batchId: row.batch_id,
+    subscriberId: row.subscriber_id,
+    subscriberAccountNumber: row.subscriber_account_number,
+    subscriberName: row.subscriber_name,
+    addressLine: row.address_line,
+    currentBillCents: row.current_bill_cents,
+    arrearsCents: row.arrears_cents,
+    expectedCents: row.expected_cents,
+    collectedCents: row.collected_cents,
+    status: row.status as BatchAccount["status"],
+  };
+}
+
+const BATCH_SELECT = `SELECT b.*, c.name AS collector_name, a.name AS collection_area_name
+  FROM collection_batches b
+  JOIN collectors c ON c.id = b.collector_id
+  LEFT JOIN collection_areas a ON a.id = b.collection_area_id`;
+
+const BATCH_ACCOUNT_SELECT = `SELECT ba.*, s.account_number AS subscriber_account_number,
+    concat_ws(' ', s.first_name, s.middle_name, s.last_name) AS subscriber_name,
+    concat_ws(', ', s.address_line, s.barangay, s.municipality) AS address_line
+  FROM batch_accounts ba
+  JOIN subscribers s ON s.id = ba.subscriber_id`;
 
 function toPaymentAllocation(row: PaymentAllocationRow): PaymentAllocation {
   return {
@@ -482,6 +783,8 @@ function toPayment(
     verifiedAt: row.verified_at ? row.verified_at.toISOString() : null,
     verifiedByUserId: row.verified_by_user_id,
     createdByUserId: row.created_by_user_id,
+    collectorId: row.collector_id,
+    collectionBatchId: row.collection_batch_id,
     createdAt: row.created_at.toISOString(),
     updatedAt: row.updated_at.toISOString(),
     allocations,
@@ -1365,13 +1668,31 @@ export class PostgresDirectoryStore implements DirectoryStore {
       if (input.method === "gcash" && input.referenceNumber) {
         await assertUniqueGcashReference(client, input.referenceNumber, null);
       }
+      let collectorId: string | null = null;
+      let batchId: string | null = null;
+      if (input.collectionBatchId) {
+        const batch = await requireBatchForUpdate(client, input.collectionBatchId);
+        if (batch.status !== "OPEN" && batch.status !== "IN_PROGRESS") {
+          throw conflict("Payments can only be recorded against an open or in-progress collection batch.");
+        }
+        const account = await client.query<{ id: string }>(
+          `SELECT id FROM batch_accounts WHERE batch_id = $1 AND subscriber_id = $2`,
+          [batch.id, input.subscriberId],
+        );
+        if (account.rowCount !== 1) {
+          throw invalidRequest("The subscriber is not part of the selected collection batch.");
+        }
+        collectorId = batch.collector_id;
+        batchId = batch.id;
+      }
       const receiptNumber = await nextNumber(client, "receipt", "RCPT-");
       const status = input.method === "gcash" ? "pending" : "posted";
       const paymentDate = input.paymentDate ? new Date(input.paymentDate).toISOString() : new Date().toISOString();
       const inserted = await client.query<{ id: string }>(
         `INSERT INTO payments
-           (receipt_number, subscriber_id, amount_cents, method, reference_number, notes, status, payment_date, created_by_user_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+           (receipt_number, subscriber_id, amount_cents, method, reference_number, notes, status, payment_date,
+            created_by_user_id, collector_id, collection_batch_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          RETURNING id`,
         [
           receiptNumber,
@@ -1383,6 +1704,8 @@ export class PostgresDirectoryStore implements DirectoryStore {
           status,
           paymentDate,
           actor.userId,
+          collectorId,
+          batchId,
         ],
       );
       const paymentId = inserted.rows[0]!.id;
@@ -1397,6 +1720,9 @@ export class PostgresDirectoryStore implements DirectoryStore {
           receiptNumber,
           entryDate: paymentDate.slice(0, 10),
         }, actor);
+        if (batchId) {
+          await applyPaymentToBatch(client, batchId, input.subscriberId, input.amountCents, input.method);
+        }
       }
       await client.query("COMMIT");
       const payment = await this.getPayment(paymentId);
@@ -1437,6 +1763,15 @@ export class PostgresDirectoryStore implements DirectoryStore {
           receiptNumber: row.receipt_number,
           entryDate: row.payment_date.toISOString().slice(0, 10),
         }, actor);
+        if (row.collection_batch_id) {
+          await applyPaymentToBatch(
+            client,
+            row.collection_batch_id,
+            row.subscriber_id,
+            row.amount_cents,
+            row.method,
+          );
+        }
         await client.query(
           `UPDATE payments SET status = 'posted', verification_note = $2, verified_at = now(),
              verified_by_user_id = $3, updated_at = now() WHERE id = $1`,
@@ -1486,6 +1821,9 @@ export class PostgresDirectoryStore implements DirectoryStore {
         );
       }
       await client.query(`DELETE FROM payment_allocations WHERE payment_id = $1`, [id]);
+      if (row.collection_batch_id) {
+        await reversePaymentFromBatch(client, row.collection_batch_id, row.subscriber_id, row.amount_cents, row.method);
+      }
       await postSubscriberLedgerEntry(
         client,
         { subscriberId: row.subscriber_id, entryDate: new Date().toISOString().slice(0, 10) },
@@ -1513,6 +1851,475 @@ export class PostgresDirectoryStore implements DirectoryStore {
     } finally {
       client.release();
     }
+  }
+
+  async listCollectors(includeInactive: boolean): Promise<Collector[]> {
+    const result = await this.pool.query<CollectorRow>(
+      `SELECT * FROM collectors WHERE $1::boolean OR is_active = true ORDER BY name`,
+      [includeInactive],
+    );
+    return result.rows.map(toCollector);
+  }
+
+  async createCollector(input: CreateCollectorInput): Promise<Collector> {
+    try {
+      const result = await this.pool.query<CollectorRow>(
+        `INSERT INTO collectors (code, name, contact_number) VALUES ($1, $2, $3) RETURNING *`,
+        [input.code, input.name, input.contactNumber ?? null],
+      );
+      return toCollector(result.rows[0]!);
+    } catch (error) {
+      if (isUniqueViolation(error)) throw conflict("A collector with that code already exists.");
+      throw error;
+    }
+  }
+
+  async updateCollector(id: string, input: UpdateCollectorInput): Promise<Collector> {
+    const assignments: string[] = [];
+    const values: unknown[] = [];
+    const setColumn = (column: string, value: unknown) => {
+      values.push(value);
+      assignments.push(`${column} = $${values.length}`);
+    };
+    if (input.name !== undefined) setColumn("name", input.name);
+    if (input.contactNumber !== undefined) setColumn("contact_number", input.contactNumber ?? null);
+    if (input.isActive !== undefined) setColumn("is_active", input.isActive);
+    if (!assignments.length) throw invalidRequest("No changes were supplied.");
+    assignments.push("updated_at = now()");
+    values.push(id);
+    const result = await this.pool.query<CollectorRow>(
+      `UPDATE collectors SET ${assignments.join(", ")} WHERE id = $${values.length} RETURNING *`,
+      values,
+    );
+    if (!result.rows[0]) throw notFound("Collector");
+    return toCollector(result.rows[0]);
+  }
+
+  async listCollectorAssignments(collectorId?: string): Promise<CollectorAssignment[]> {
+    const filters = collectorId ? "WHERE ca.collector_id = $1" : "";
+    const result = await this.pool.query<CollectorAssignmentRow>(
+      `SELECT ca.id, ca.collector_id, c.name AS collector_name, ca.subscriber_id,
+              s.account_number AS subscriber_account_number,
+              concat_ws(' ', s.first_name, s.middle_name, s.last_name) AS subscriber_name,
+              ca.collection_area_id, a.name AS collection_area_name, ca.is_active, ca.assigned_at
+       FROM collector_assignments ca
+       JOIN collectors c ON c.id = ca.collector_id
+       JOIN subscribers s ON s.id = ca.subscriber_id
+       LEFT JOIN collection_areas a ON a.id = ca.collection_area_id
+       ${filters}
+       ORDER BY c.name, s.account_number`,
+      collectorId ? [collectorId] : [],
+    );
+    return result.rows.map(toCollectorAssignment);
+  }
+
+  async createCollectorAssignments(input: CreateCollectorAssignmentInput): Promise<CollectorAssignment[]> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const collector = await client.query<{ id: string }>(
+        `SELECT id FROM collectors WHERE id = $1 AND is_active = true`,
+        [input.collectorId],
+      );
+      if (collector.rowCount !== 1) throw invalidRequest("The selected collector is unavailable.");
+      if (input.collectionAreaId) await assertAreaAvailable(client, input.collectionAreaId);
+      for (const subscriberId of input.subscriberIds) {
+        await requireSubscriberExists(client, subscriberId);
+        await client.query(
+          `INSERT INTO collector_assignments (collector_id, subscriber_id, collection_area_id, is_active, assigned_at)
+           VALUES ($1, $2, $3, true, now())
+           ON CONFLICT (collector_id, subscriber_id)
+           DO UPDATE SET collection_area_id = EXCLUDED.collection_area_id, is_active = true, assigned_at = now()`,
+          [input.collectorId, subscriberId, input.collectionAreaId ?? null],
+        );
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.listCollectorAssignments(input.collectorId);
+  }
+
+  async removeCollectorAssignment(id: string): Promise<void> {
+    const result = await this.pool.query(`DELETE FROM collector_assignments WHERE id = $1`, [id]);
+    if (result.rowCount === 0) throw notFound("Collector assignment");
+  }
+
+  async listCollectionBatches(query: CollectionBatchListQuery): Promise<CollectionBatchListResponse> {
+    const filters: string[] = [];
+    const values: unknown[] = [];
+    if (query.collectorId) {
+      values.push(query.collectorId);
+      filters.push(`b.collector_id = $${values.length}`);
+    }
+    if (query.status) {
+      values.push(query.status);
+      filters.push(`b.status = $${values.length}`);
+    }
+    if (query.from) {
+      values.push(query.from);
+      filters.push(`b.route_date >= $${values.length}`);
+    }
+    if (query.to) {
+      values.push(query.to);
+      filters.push(`b.route_date <= $${values.length}`);
+    }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const countResult = await this.pool.query<{ total: string }>(
+      `SELECT count(*)::text AS total FROM collection_batches b ${where}`,
+      values,
+    );
+    const offset = (query.page - 1) * query.pageSize;
+    const result = await this.pool.query<CollectionBatchRow>(
+      `${BATCH_SELECT} ${where} ORDER BY b.route_date DESC, b.created_at DESC LIMIT ${query.pageSize} OFFSET ${offset}`,
+      values,
+    );
+    return {
+      batches: result.rows.map((row) => toCollectionBatch(row)),
+      total: Number(countResult.rows[0]?.total ?? 0),
+      page: query.page,
+      pageSize: query.pageSize,
+    };
+  }
+
+  async getCollectionBatch(id: string): Promise<CollectionBatch> {
+    const result = await this.pool.query<CollectionBatchRow>(`${BATCH_SELECT} WHERE b.id = $1`, [id]);
+    const row = result.rows[0];
+    if (!row) throw notFound("Collection batch");
+    const accounts = await this.loadBatchAccounts(this.pool, id);
+    return toCollectionBatch(row, accounts);
+  }
+
+  async createCollectionBatch(input: CreateCollectionBatchInput, actor: DirectoryActor): Promise<CollectionBatch> {
+    const client = await this.pool.connect();
+    let batchId = "";
+    try {
+      await client.query("BEGIN");
+      const collector = await client.query<{ id: string }>(
+        `SELECT id FROM collectors WHERE id = $1 AND is_active = true`,
+        [input.collectorId],
+      );
+      if (collector.rowCount !== 1) throw invalidRequest("The selected collector is unavailable.");
+      if (input.collectionAreaId) await assertAreaAvailable(client, input.collectionAreaId);
+      const batchNumber = await nextNumber(client, "collection_batch", "BATCH-");
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO collection_batches
+           (batch_number, collector_id, collection_area_id, route_date, status, notes, opened_by_user_id)
+         VALUES ($1, $2, $3, $4, 'OPEN', $5, $6)
+         RETURNING id`,
+        [batchNumber, input.collectorId, input.collectionAreaId ?? null, input.routeDate, input.notes ?? null, actor.userId],
+      );
+      batchId = inserted.rows[0]!.id;
+      const assignments = await client.query<{ subscriber_id: string }>(
+        `SELECT subscriber_id FROM collector_assignments
+         WHERE collector_id = $1 AND is_active = true
+           AND ($2::uuid IS NULL OR collection_area_id = $2)
+         ORDER BY subscriber_id`,
+        [input.collectorId, input.collectionAreaId ?? null],
+      );
+      let expectedTotal = 0;
+      for (const assignment of assignments.rows) {
+        const balances = await client.query<{ arrears_cents: string; current_cents: string }>(
+          `SELECT
+             COALESCE(SUM(CASE WHEN due_date < $2::date THEN balance_cents ELSE 0 END), 0)::text AS arrears_cents,
+             COALESCE(SUM(CASE WHEN due_date >= $2::date THEN balance_cents ELSE 0 END), 0)::text AS current_cents
+           FROM invoices
+           WHERE subscriber_id = $1 AND status IN ('posted', 'partially_paid', 'overdue') AND balance_cents > 0`,
+          [assignment.subscriber_id, input.routeDate],
+        );
+        const arrears = Number(balances.rows[0]?.arrears_cents ?? 0);
+        const current = Number(balances.rows[0]?.current_cents ?? 0);
+        expectedTotal += arrears + current;
+        await client.query(
+          `INSERT INTO batch_accounts (batch_id, subscriber_id, current_bill_cents, arrears_cents, expected_cents)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [batchId, assignment.subscriber_id, current, arrears, arrears + current],
+        );
+      }
+      await client.query(`UPDATE collection_batches SET expected_cents = $2, updated_at = now() WHERE id = $1`, [
+        batchId,
+        expectedTotal,
+      ]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.getCollectionBatch(batchId);
+  }
+
+  async startCollectionBatch(id: string, _actor: DirectoryActor): Promise<CollectionBatch> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const row = await requireBatchForUpdate(client, id);
+      if (row.status !== "OPEN") throw conflict("Only an OPEN batch can be started.");
+      await client.query(`UPDATE collection_batches SET status = 'IN_PROGRESS', updated_at = now() WHERE id = $1`, [id]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.getCollectionBatch(id);
+  }
+
+  async submitCollectionBatch(id: string, _actor: DirectoryActor): Promise<CollectionBatch> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const row = await requireBatchForUpdate(client, id);
+      if (row.status !== "IN_PROGRESS") throw conflict("Only an in-progress batch can be submitted.");
+      await client.query(
+        `UPDATE collection_batches SET status = 'SUBMITTED', submitted_at = now(), updated_at = now() WHERE id = $1`,
+        [id],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.getCollectionBatch(id);
+  }
+
+  async remitCollectionBatch(
+    id: string,
+    input: RemitCollectionBatchInput,
+    actor: DirectoryActor,
+  ): Promise<CollectionBatch> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const row = await requireBatchForUpdate(client, id);
+      if (row.status !== "SUBMITTED") throw conflict("Only a submitted batch can be remitted.");
+      const collected = row.cash_collected_cents + row.non_cash_collected_cents;
+      const difference = collected - input.amountCents;
+      await client.query(
+        `INSERT INTO collector_remittances (batch_id, amount_cents, reference_number, notes, recorded_by_user_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [id, input.amountCents, input.referenceNumber ?? null, input.notes ?? null, actor.userId],
+      );
+      await client.query(
+        `UPDATE collection_batches
+         SET status = 'REMITTED', remitted_cents = $2, shortage_cents = $3, overage_cents = $4,
+             remitted_at = now(), updated_at = now()
+         WHERE id = $1`,
+        [id, input.amountCents, Math.max(difference, 0), Math.max(-difference, 0)],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.getCollectionBatch(id);
+  }
+
+  async reconcileCollectionBatch(
+    id: string,
+    input: ReconcileCollectionBatchInput,
+    _actor: DirectoryActor,
+  ): Promise<CollectionBatch> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const row = await requireBatchForUpdate(client, id);
+      if (row.status !== "REMITTED") throw conflict("Only a remitted batch can be reconciled.");
+      const note = [row.notes, input.note].filter(Boolean).join(" | ") || null;
+      await client.query(
+        `UPDATE collection_batches SET status = 'RECONCILED', notes = $2, reconciled_at = now(), updated_at = now()
+         WHERE id = $1`,
+        [id, note],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.getCollectionBatch(id);
+  }
+
+  async closeCollectionBatch(id: string, actor: DirectoryActor): Promise<CollectionBatch> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const row = await requireBatchForUpdate(client, id);
+      if (row.status !== "RECONCILED") throw conflict("Only a reconciled batch can be closed.");
+      await client.query(
+        `UPDATE collection_batches SET status = 'CLOSED', closed_at = now(), closed_by_user_id = $2, updated_at = now()
+         WHERE id = $1`,
+        [id, actor.userId],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return this.getCollectionBatch(id);
+  }
+
+  async getRouteSheet(id: string): Promise<RouteSheet> {
+    const batch = await this.getCollectionBatch(id);
+    return { batch, accounts: batch.accounts ?? [] };
+  }
+
+  async getCollectorReport(from?: string, to?: string): Promise<CollectorReport> {
+    const filters: string[] = [];
+    const values: unknown[] = [];
+    if (from) {
+      values.push(from);
+      filters.push(`b.route_date >= $${values.length}`);
+    }
+    if (to) {
+      values.push(to);
+      filters.push(`b.route_date <= $${values.length}`);
+    }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const result = await this.pool.query<CollectorReportRow>(
+      `SELECT c.id AS collector_id, c.name AS collector_name, count(b.id)::text AS batches,
+              COALESCE(SUM(b.expected_cents), 0)::text AS expected_cents,
+              COALESCE(SUM(b.cash_collected_cents + b.non_cash_collected_cents), 0)::text AS collected_cents,
+              COALESCE(SUM(COALESCE(b.remitted_cents, 0)), 0)::text AS remitted_cents,
+              COALESCE(SUM(b.shortage_cents), 0)::text AS shortage_cents,
+              COALESCE(SUM(b.overage_cents), 0)::text AS overage_cents
+       FROM collectors c
+       LEFT JOIN collection_batches b ON b.collector_id = c.id ${where}
+       GROUP BY c.id, c.name
+       ORDER BY c.name`,
+      values,
+    );
+    return {
+      from: from ?? null,
+      to: to ?? null,
+      rows: result.rows.map((row) => ({
+        collectorId: row.collector_id,
+        collectorName: row.collector_name,
+        batches: Number(row.batches),
+        expectedCents: Number(row.expected_cents),
+        collectedCents: Number(row.collected_cents),
+        remittedCents: Number(row.remitted_cents),
+        shortageCents: Number(row.shortage_cents),
+        overageCents: Number(row.overage_cents),
+      })),
+    };
+  }
+
+  async listInvoiceFacts(filter: DateRange): Promise<InvoiceFact[]> {
+    const result = await this.pool.query<InvoiceFactRow>(
+      `SELECT i.id, i.invoice_number, i.subscriber_id, i.service_account_id,
+              i.issue_date, i.due_date, i.total_cents, i.amount_paid_cents, i.balance_cents, i.status,
+              s.account_number AS subscriber_account_number,
+              s.last_name || ', ' || s.first_name || COALESCE(' ' || s.middle_name, '') AS subscriber_name,
+              p.name AS plan_name, sa.service_type, ca.name AS collection_area_name
+       FROM invoices i
+       JOIN subscribers s ON s.id = i.subscriber_id
+       LEFT JOIN service_accounts sa ON sa.id = i.service_account_id
+       LEFT JOIN service_plans p ON p.id = sa.plan_id
+       LEFT JOIN collection_areas ca ON ca.id = sa.collection_area_id
+       WHERE ($1::date IS NULL OR i.issue_date >= $1::date)
+         AND ($2::date IS NULL OR i.issue_date <= $2::date)
+       ORDER BY i.issue_date DESC, i.invoice_number`,
+      [filter.from ?? null, filter.to ?? null],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      invoiceNumber: row.invoice_number,
+      subscriberId: row.subscriber_id,
+      subscriberAccountNumber: row.subscriber_account_number,
+      subscriberName: row.subscriber_name,
+      serviceAccountId: row.service_account_id,
+      planName: row.plan_name,
+      serviceType: row.service_type as InvoiceFact["serviceType"],
+      collectionAreaName: row.collection_area_name,
+      issueDate: row.issue_date,
+      dueDate: row.due_date,
+      totalCents: row.total_cents,
+      amountPaidCents: row.amount_paid_cents,
+      balanceCents: row.balance_cents,
+      status: row.status as InvoiceFact["status"],
+    }));
+  }
+
+  async listPaymentFacts(filter: DateRange): Promise<PaymentFact[]> {
+    const result = await this.pool.query<PaymentFactRow>(
+      `SELECT p.id, p.receipt_number, p.subscriber_id, p.amount_cents, p.method, p.status,
+              p.payment_date, p.collector_id, p.collection_batch_id,
+              s.account_number AS subscriber_account_number,
+              s.last_name || ', ' || s.first_name || COALESCE(' ' || s.middle_name, '') AS subscriber_name
+       FROM payments p
+       JOIN subscribers s ON s.id = p.subscriber_id
+       WHERE ($1::date IS NULL OR p.payment_date >= $1::date)
+         AND ($2::date IS NULL OR p.payment_date < ($2::date + INTERVAL '1 day'))
+       ORDER BY p.payment_date DESC`,
+      [filter.from ?? null, filter.to ?? null],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      receiptNumber: row.receipt_number,
+      subscriberId: row.subscriber_id,
+      subscriberAccountNumber: row.subscriber_account_number,
+      subscriberName: row.subscriber_name,
+      method: row.method as PaymentFact["method"],
+      status: row.status as PaymentFact["status"],
+      amountCents: row.amount_cents,
+      paymentDate: row.payment_date.toISOString(),
+      collectorId: row.collector_id,
+      collectionBatchId: row.collection_batch_id,
+    }));
+  }
+
+  async listSubscriberRows(): Promise<SubscriberSummary[]> {
+    const result = await this.pool.query<SubscriberRow>(
+      `${SUBSCRIBER_SUMMARY_SELECT}
+       ${SUBSCRIBER_SUMMARY_GROUP}
+       ORDER BY s.account_number`,
+    );
+    return result.rows.map(toSubscriberSummary);
+  }
+
+  async listLedgerFacts(filter: { subscriberId?: string } & DateRange): Promise<LedgerFact[]> {
+    const result = await this.pool.query<LedgerFactRow>(
+      `SELECT id, subscriber_id, service_account_id, invoice_id, entry_date, entry_type, source_type,
+              amount_cents, balance_cents, description, created_at
+       FROM ledger_entries
+       WHERE ($1::uuid IS NULL OR subscriber_id = $1)
+       ORDER BY entry_date ASC, created_at ASC`,
+      [filter.subscriberId ?? null],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      subscriberId: row.subscriber_id,
+      serviceAccountId: row.service_account_id,
+      invoiceId: row.invoice_id,
+      entryDate: row.entry_date,
+      entryType: row.entry_type as LedgerFact["entryType"],
+      sourceType: row.source_type,
+      amountCents: row.amount_cents,
+      balanceCents: row.balance_cents,
+      description: row.description,
+      createdAt: row.created_at.toISOString(),
+    }));
+  }
+
+private async loadBatchAccounts(client: Pool | PoolClient, batchId: string): Promise<BatchAccount[]> {
+    const result = await client.query<BatchAccountRow>(
+      `${BATCH_ACCOUNT_SELECT} WHERE ba.batch_id = $1 ORDER BY subscriber_name`,
+      [batchId],
+    );
+    return result.rows.map(toBatchAccount);
   }
 
   private async insertPaymentProof(
@@ -1550,6 +2357,249 @@ export class PostgresDirectoryStore implements DirectoryStore {
     const account = await this.getServiceAccount(id);
     if (!account) throw notFound("Service account");
     return account;
+  }
+
+  async getAgingReport(asOf?: string): Promise<AgingReport> {
+    const reference = asOf ?? new Date().toISOString().slice(0, 10);
+    const result = await this.pool.query<OpenInvoiceReportRow>(
+      `SELECT i.subscriber_id, i.service_account_id, i.balance_cents,
+              GREATEST(($1::date - i.due_date), 0) AS overdue_days,
+              s.account_number, s.first_name, s.middle_name, s.last_name
+       FROM invoices i
+       JOIN subscribers s ON s.id = i.subscriber_id
+       WHERE i.status IN ('posted', 'partially_paid', 'overdue') AND i.balance_cents > 0`,
+      [reference],
+    );
+    const rowsBySubscriber = new Map<string, AgingReportRow>();
+    for (const row of result.rows) {
+      let reportRow = rowsBySubscriber.get(row.subscriber_id);
+      if (!reportRow) {
+        reportRow = {
+          subscriberId: row.subscriber_id,
+          subscriberAccountNumber: row.account_number,
+          subscriberName: formatSubscriberName(row.first_name, row.middle_name, row.last_name),
+          totalBalanceCents: 0,
+          currentCents: 0,
+          buckets: emptyAgingBuckets(),
+        };
+        rowsBySubscriber.set(row.subscriber_id, reportRow);
+      }
+      reportRow.totalBalanceCents += row.balance_cents;
+      if (row.overdue_days <= 0) {
+        reportRow.currentCents += row.balance_cents;
+        continue;
+      }
+      const bucket = reportRow.buckets[bucketIndexForDays(row.overdue_days)]!;
+      bucket.amountCents += row.balance_cents;
+      bucket.count += 1;
+    }
+    const rows = [...rowsBySubscriber.values()].sort(
+      (left, right) => right.totalBalanceCents - left.totalBalanceCents,
+    );
+    return {
+      asOf: reference,
+      buckets: AGING_BUCKET_DEFINITIONS.map(({ label, minDays, maxDays }) => ({ label, minDays, maxDays })),
+      rows,
+      totals: {
+        totalBalanceCents: rows.reduce((sum, row) => sum + row.totalBalanceCents, 0),
+        currentCents: rows.reduce((sum, row) => sum + row.currentCents, 0),
+      },
+    };
+  }
+
+  async getOverdueInvoices(asOf?: string): Promise<OverdueList> {
+    const reference = asOf ?? new Date().toISOString().slice(0, 10);
+    const result = await this.pool.query<OverdueInvoiceRow>(
+      `SELECT i.id, i.invoice_number, i.subscriber_id, i.issue_date, i.due_date,
+              i.total_cents, i.amount_paid_cents, i.balance_cents, i.status,
+              GREATEST(($1::date - i.due_date), 0) AS overdue_days,
+              s.account_number AS subscriber_account_number,
+              s.last_name || ', ' || s.first_name || COALESCE(' ' || s.middle_name, '') AS subscriber_name
+       FROM invoices i
+       JOIN subscribers s ON s.id = i.subscriber_id
+       WHERE i.status IN ('posted', 'partially_paid', 'overdue')
+         AND i.balance_cents > 0 AND i.due_date < $1::date
+       ORDER BY overdue_days DESC, i.due_date ASC, i.issue_date ASC`,
+      [reference],
+    );
+    const invoices = result.rows.map((row) => ({
+      id: row.id,
+      invoiceNumber: row.invoice_number,
+      subscriberId: row.subscriber_id,
+      subscriberAccountNumber: row.subscriber_account_number,
+      subscriberName: row.subscriber_name,
+      dueDate: row.due_date,
+      issueDate: row.issue_date,
+      totalCents: row.total_cents,
+      amountPaidCents: row.amount_paid_cents,
+      balanceCents: row.balance_cents,
+      daysOverdue: row.overdue_days,
+      status: row.status as Invoice["status"],
+    }));
+    return {
+      asOf: reference,
+      invoices,
+      totalBalanceCents: invoices.reduce((sum, invoice) => sum + invoice.balanceCents, 0),
+      count: invoices.length,
+    };
+  }
+
+  async getSuspensionCandidates(asOf?: string): Promise<SuspensionList> {
+    const reference = asOf ?? new Date().toISOString().slice(0, 10);
+    const result = await this.pool.query<OpenInvoiceReportRow>(
+      `SELECT i.subscriber_id, i.service_account_id, i.balance_cents,
+              GREATEST(($1::date - i.due_date), 0) AS overdue_days,
+              s.account_number, s.first_name, s.middle_name, s.last_name,
+              sa.account_number AS service_account_number
+       FROM invoices i
+       JOIN subscribers s ON s.id = i.subscriber_id
+       JOIN service_accounts sa ON sa.id = i.service_account_id
+       WHERE i.status IN ('posted', 'partially_paid', 'overdue')
+         AND i.balance_cents > 0 AND i.due_date < $1::date AND sa.status = 'ACTIVE'`,
+      [reference],
+    );
+    const grouped = new Map<string, SuspensionCandidate>();
+    for (const row of result.rows) {
+      if (!row.service_account_id) continue;
+      let candidate = grouped.get(row.service_account_id);
+      if (!candidate) {
+        candidate = {
+          subscriberId: row.subscriber_id,
+          subscriberAccountNumber: row.account_number,
+          subscriberName: formatSubscriberName(row.first_name, row.middle_name, row.last_name),
+          serviceAccountId: row.service_account_id,
+          serviceAccountNumber: row.service_account_number,
+          totalOverdueCents: 0,
+          oldestOverdueDays: 0,
+          invoiceCount: 0,
+        };
+        grouped.set(row.service_account_id, candidate);
+      }
+      candidate.totalOverdueCents += row.balance_cents;
+      candidate.invoiceCount += 1;
+      candidate.oldestOverdueDays = Math.max(candidate.oldestOverdueDays, row.overdue_days);
+    }
+    const candidates = [...grouped.values()].sort(
+      (left, right) =>
+        right.oldestOverdueDays - left.oldestOverdueDays || right.totalOverdueCents - left.totalOverdueCents,
+    );
+    return { asOf: reference, candidates };
+  }
+
+  async listSuspensions(serviceAccountId?: string): Promise<ServiceSuspension[]> {
+    const filters: string[] = [];
+    const values: unknown[] = [];
+    if (serviceAccountId) {
+      values.push(serviceAccountId);
+      filters.push(`service_account_id = $${values.length}`);
+    }
+    const where = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const result = await this.pool.query<ServiceSuspensionRow>(
+      `SELECT * FROM service_suspensions ${where} ORDER BY suspended_at DESC, id DESC`,
+      values,
+    );
+    return result.rows.map(toServiceSuspension);
+  }
+
+  async suspendServiceAccount(
+    serviceAccountId: string,
+    input: SuspendServiceAccountInput,
+    actor: DirectoryActor,
+  ): Promise<ServiceSuspension> {
+    const client = await this.pool.connect();
+    let suspensionId!: string;
+    try {
+      await client.query("BEGIN");
+      const existing = await client.query<{ status: string; subscriber_id: string }>(
+        `SELECT status, subscriber_id FROM service_accounts WHERE id = $1 FOR UPDATE`,
+        [serviceAccountId],
+      );
+      const account = existing.rows[0];
+      if (!account) throw notFound("Service account");
+      if (account.status === "SUSPENDED") throw conflict("That service account is already suspended.");
+      if (account.status !== "ACTIVE") throw invalidRequest("Only active service accounts can be suspended.");
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO service_suspensions (service_account_id, subscriber_id, reason, notes, suspended_by_user_id)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id`,
+        [serviceAccountId, account.subscriber_id, input.reason ?? null, input.notes ?? null, actor.userId],
+      );
+      suspensionId = inserted.rows[0]!.id;
+      await client.query(
+        `UPDATE service_accounts SET status = 'SUSPENDED', updated_at = now() WHERE id = $1`,
+        [serviceAccountId],
+      );
+      await client.query(
+        `INSERT INTO service_events (service_account_id, from_status, to_status, reason, changed_by_user_id)
+         VALUES ($1, $2, 'SUSPENDED', $3, $4)`,
+        [serviceAccountId, account.status, input.reason ?? "Suspended for non-payment", actor.userId],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    const result = await this.pool.query<ServiceSuspensionRow>(
+      `SELECT * FROM service_suspensions WHERE id = $1`,
+      [suspensionId],
+    );
+    return toServiceSuspension(result.rows[0]!);
+  }
+
+  async reconnectServiceAccount(
+    serviceAccountId: string,
+    input: ReconnectServiceAccountInput,
+    actor: DirectoryActor,
+  ): Promise<ServiceSuspension> {
+    const client = await this.pool.connect();
+    let suspension!: ServiceSuspensionRow;
+    try {
+      await client.query("BEGIN");
+      const existing = await client.query<{ status: string }>(
+        `SELECT status FROM service_accounts WHERE id = $1 FOR UPDATE`,
+        [serviceAccountId],
+      );
+      const account = existing.rows[0];
+      if (!account) throw notFound("Service account");
+      const open = await client.query<ServiceSuspensionRow>(
+        `SELECT * FROM service_suspensions
+         WHERE service_account_id = $1 AND reconnected_at IS NULL
+         ORDER BY suspended_at DESC, id DESC
+         LIMIT 1
+         FOR UPDATE`,
+        [serviceAccountId],
+      );
+      const openSuspension = open.rows[0];
+      if (account.status !== "SUSPENDED" || !openSuspension) {
+        throw invalidRequest("That service account is not currently suspended.");
+      }
+      const updated = await client.query<ServiceSuspensionRow>(
+        `UPDATE service_suspensions
+         SET reconnected_at = now(), reconnected_by_user_id = $2, reconnection_reason = $3, updated_at = now()
+         WHERE id = $1
+         RETURNING *`,
+        [openSuspension.id, actor.userId, input.reason ?? null],
+      );
+      suspension = updated.rows[0]!;
+      await client.query(
+        `UPDATE service_accounts SET status = 'ACTIVE', updated_at = now() WHERE id = $1`,
+        [serviceAccountId],
+      );
+      await client.query(
+        `INSERT INTO service_events (service_account_id, from_status, to_status, reason, changed_by_user_id)
+         VALUES ($1, 'SUSPENDED', 'ACTIVE', $2, $3)`,
+        [serviceAccountId, input.reason ?? "Reconnected after payment", actor.userId],
+      );
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return toServiceSuspension(suspension);
   }
 }
 
@@ -1776,6 +2826,78 @@ async function assertUniqueGcashReference(
   }
 }
 
+async function requireBatchForUpdate(client: PoolClient, id: string): Promise<CollectionBatchRow> {
+  const lock = await client.query<{ id: string }>(
+    `SELECT id FROM collection_batches WHERE id = $1 FOR UPDATE`,
+    [id],
+  );
+  if (!lock.rows[0]) throw notFound("Collection batch");
+  const result = await client.query<CollectionBatchRow>(`${BATCH_SELECT} WHERE b.id = $1`, [id]);
+  return result.rows[0]!;
+}
+
+async function applyPaymentToBatch(
+  client: PoolClient,
+  batchId: string,
+  subscriberId: string,
+  amountCents: number,
+  method: string,
+): Promise<void> {
+  const cash = method === "cash" ? amountCents : 0;
+  const nonCash = amountCents - cash;
+  await client.query(
+    `UPDATE collection_batches
+     SET cash_collected_cents = cash_collected_cents + $2,
+         non_cash_collected_cents = non_cash_collected_cents + $3,
+         updated_at = now()
+     WHERE id = $1`,
+    [batchId, cash, nonCash],
+  );
+  await client.query(
+    `UPDATE batch_accounts
+     SET collected_cents = collected_cents + $3,
+         status = CASE
+           WHEN expected_cents > 0 AND collected_cents + $3 >= expected_cents THEN 'COLLECTED'
+           WHEN collected_cents + $3 > 0 THEN 'PARTIAL'
+           ELSE status
+         END,
+         updated_at = now()
+     WHERE batch_id = $1 AND subscriber_id = $2`,
+    [batchId, subscriberId, amountCents],
+  );
+}
+
+async function reversePaymentFromBatch(
+  client: PoolClient,
+  batchId: string,
+  subscriberId: string,
+  amountCents: number,
+  method: string,
+): Promise<void> {
+  const cash = method === "cash" ? amountCents : 0;
+  const nonCash = amountCents - cash;
+  await client.query(
+    `UPDATE collection_batches
+     SET cash_collected_cents = GREATEST(cash_collected_cents - $2, 0),
+         non_cash_collected_cents = GREATEST(non_cash_collected_cents - $3, 0),
+         updated_at = now()
+     WHERE id = $1`,
+    [batchId, cash, nonCash],
+  );
+  await client.query(
+    `UPDATE batch_accounts
+     SET collected_cents = GREATEST(collected_cents - $3, 0),
+         status = CASE
+           WHEN expected_cents > 0 AND GREATEST(collected_cents - $3, 0) >= expected_cents THEN 'COLLECTED'
+           WHEN GREATEST(collected_cents - $3, 0) > 0 THEN 'PARTIAL'
+           ELSE 'PENDING'
+         END,
+         updated_at = now()
+     WHERE batch_id = $1 AND subscriber_id = $2`,
+    [batchId, subscriberId, amountCents],
+  );
+}
+
 function buildAllocationPreview(
   subscriberId: string,
   amountCents: number,
@@ -1805,3 +2927,4 @@ function buildAllocationPreview(
     allocations,
   };
 }
+

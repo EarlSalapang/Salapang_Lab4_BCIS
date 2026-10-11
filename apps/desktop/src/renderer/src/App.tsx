@@ -14,6 +14,10 @@ import PlansPage from "./pages/PlansPage";
 import SubscribersPage from "./pages/SubscribersPage";
 import ServiceAccountsPage from "./pages/ServiceAccountsPage";
 import PaymentsPage from "./pages/PaymentsPage";
+import CollectionsPage from "./pages/CollectionsPage";
+import ReceivablesPage from "./pages/ReceivablesPage";
+import DashboardPage from "./pages/DashboardPage";
+import ReportsPage from "./pages/ReportsPage";
 
 const navigation = [
   { label: "Dashboard", icon: "◫" },
@@ -22,13 +26,13 @@ const navigation = [
   { label: "Plans & Areas", icon: "▦", permission: "plan.manage" },
   { label: "Billing", icon: "▤", permission: "subscriber.view" },
   { label: "Payments", icon: "₱", permission: "subscriber.view" },
-  { label: "Collections", icon: "⇄" },
-  { label: "Receivables", icon: "◷" },
+  { label: "Collections", icon: "⇄", permission: "collection.manage" },
+  { label: "Receivables", icon: "◷", permission: "subscriber.view" },
   { label: "Reports", icon: "▥", permission: "report.view" },
   { label: "Administration", icon: "⚙", permission: "user.manage" },
 ];
 
-const implementedPages = ["Billing", "Payments", "Plans & Areas", "Subscribers", "Service Accounts", "Administration"];
+const implementedPages = ["Dashboard", "Billing", "Payments", "Collections", "Receivables", "Reports", "Plans & Areas", "Subscribers", "Service Accounts", "Administration"];
 
 const invoiceStatuses: InvoiceStatus[] = ["draft", "posted", "partially_paid", "paid", "overdue", "void"];
 
@@ -438,6 +442,12 @@ setInvoices((current) =>
           <PlansPage onMessage={setMessage} />
         ) : page === "Payments" ? (
           <PaymentsPage permissions={user.permissions} onMessage={setMessage} />
+        ) : page === "Collections" ? (
+          <CollectionsPage permissions={user.permissions} onMessage={setMessage} />
+        ) : page === "Receivables" ? (
+          <ReceivablesPage permissions={user.permissions} onMessage={setMessage} />
+        ) : page === "Reports" ? (
+          <ReportsPage permissions={user.permissions} onMessage={setMessage} />
         ) : page === "Billing" ? (
           <section className="content-section" aria-labelledby="billing-title">
             <div className="section-heading">
@@ -736,36 +746,7 @@ setInvoices((current) =>
             </div>
           </section>
         ) : (
-          <section className="content-section" aria-labelledby="dashboard-title">
-            <div className="section-heading">
-              <div>
-                <span className="eyebrow">Dashboard</span>
-                <h2 id="dashboard-title">Welcome back, {user.displayName}</h2>
-              </div>
-            </div>
-            <div className="foundation-grid">
-              <article className="service-card">
-                <span className="service-label">Signed in as</span>
-                <strong>{user.username}</strong>
-                <p>{user.roles.join(", ") || "No role assigned"}</p>
-                <span className="service-state">{`${user.permissions.length} permission(s)`}</span>
-              </article>
-              <article className="service-card">
-                <span className="service-label">API health</span>
-                <strong>{apiHealth?.status === "online" ? "Online" : "Offline"}</strong>
-                <p>Central Fastify API server.</p>
-                <span className="service-state">{apiHealth?.status === "online" ? "Connected" : "Unreachable"}</span>
-              </article>
-              <article className="service-card">
-                <span className="service-label">Billing</span>
-                <strong>Invoice &amp; ledger engine</strong>
-                <p>Generate monthly invoices and review ledger entries.</p>
-                <button className="text-button" type="button" onClick={() => setPage("Billing")}>
-                  Open billing
-                </button>
-              </article>
-            </div>
-          </section>
+          <DashboardPage permissions={user.permissions} onMessage={setMessage} />
         )}
       </main>
     </div>

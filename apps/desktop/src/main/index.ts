@@ -1,13 +1,26 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { writeFile } from "node:fs/promises";
 import {
+  agingReportSchema,
   allocationPreviewInputSchema,
   allocationPreviewSchema,
   apiHealthSchema,
   authUserSchema,
   billingGenerationResultSchema,
+  dashboardSchema,
+  closeCollectionBatchInputSchema,
   collectionAreaListSchema,
   collectionAreaResponseSchema,
+  collectionBatchListSchema,
+  collectionBatchResponseSchema,
+  collectorAssignmentListSchema,
+  collectorListSchema,
+  collectorReportSchema,
+  collectorResponseSchema,
   createCollectionAreaInputSchema,
+  createCollectorAssignmentInputSchema,
+  createCollectionBatchInputSchema,
+  createCollectorInputSchema,
   createInvoiceInputSchema,
   createPaymentInputSchema,
   createPlanInputSchema,
@@ -22,16 +35,28 @@ import {
   loginInputSchema,
   loginResponseSchema,
   managedUserSchema,
+  overdueListSchema,
   paymentListSchema,
   paymentResponseSchema,
+  reconcileCollectionBatchInputSchema,
+  reportCatalogSchema,
+  reportSchema,
+  reconnectServiceAccountInputSchema,
+  remitCollectionBatchInputSchema,
   reversePaymentInputSchema,
+  routeSheetSchema,
   serviceAccountListSchema,
   serviceAccountResponseSchema,
   servicePlanListSchema,
   servicePlanResponseSchema,
+  serviceSuspensionListSchema,
+  serviceSuspensionResponseSchema,
   stringArraySchema,
   subscriberListSchema,
   subscriberResponseSchema,
+  suspendServiceAccountInputSchema,
+  suspensionListSchema,
+  updateCollectorInputSchema,
   updateInvoiceInputSchema,
   updatePlanInputSchema,
   updateServiceAccountInputSchema,
@@ -42,6 +67,8 @@ import type { DesktopApiHealth, ManagedUser } from "@bcis/shared";
 import type { ZodType } from "zod";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { buildReportPdf, buildReportWorkbook } from "./exporters";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const apiBaseUrl = process.env.BCIS_API_URL ?? "http://127.0.0.1:3000";
@@ -444,6 +471,230 @@ ipcMain.handle("bcis:reverse-payment", (_event, payload: unknown) => {
 });
 
 
+ipcMain.handle("bcis:list-collectors", (_event, includeInactive: unknown) =>
+  directoryRequest(`/collectors${queryString({ includeInactive: includeInactive === true ? "true" : "" })}`, collectorListSchema));
+
+ipcMain.handle("bcis:create-collector", (_event, input: unknown) => {
+  const parsed = createCollectorInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Enter a valid collector code and name." };
+  return directoryRequest("/collectors", collectorResponseSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:update-collector", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return { ok: false, message: split.message };
+  const parsed = updateCollectorInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Enter valid collector details." };
+  return directoryRequest(`/collectors/${split.id}`, collectorResponseSchema, { method: "PATCH", body: parsed.data });
+});
+
+ipcMain.handle("bcis:list-collector-assignments", (_event, collectorId: unknown) => {
+  const query = typeof collectorId === "string" && collectorId.length > 0 ? queryString({ collectorId }) : "";
+  return directoryRequest(`/collector-assignments${query}`, collectorAssignmentListSchema);
+});
+
+ipcMain.handle("bcis:create-collector-assignments", (_event, input: unknown) => {
+  const parsed = createCollectorAssignmentInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Select a collector and at least one subscriber." };
+  return directoryRequest("/collector-assignments", collectorAssignmentListSchema, {
+    method: "POST",
+    body: parsed.data,
+  });
+});
+
+ipcMain.handle("bcis:remove-collector-assignment", async (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  if (!sessionToken) return { ok: false, message: "Sign in to continue." };
+  try {
+    const response = await requestApi(`/collector-assignments/${identifier.data}`, { method: "DELETE" });
+    if (response.status === 401) {
+      sessionToken = null;
+      return { ok: false, message: "Your session has expired. Sign in again." };
+    }
+    if (!response.ok) return { ok: false, message: await apiError(response) };
+    return { ok: true, data: { removed: true } };
+  } catch {
+    return { ok: false, message: "Unable to reach the API server." };
+  }
+});
+
+ipcMain.handle("bcis:list-collection-batches", (_event, params: unknown) =>
+  directoryRequest(
+    `/collection-batches${queryString(listParams(params, ["collectorId", "status", "from", "to", "page", "pageSize"]))}`,
+    collectionBatchListSchema,
+  ));
+
+ipcMain.handle("bcis:get-collection-batch", (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  return directoryRequest(`/collection-batches/${identifier.data}`, collectionBatchResponseSchema);
+});
+
+ipcMain.handle("bcis:create-collection-batch", (_event, input: unknown) => {
+  const parsed = createCollectionBatchInputSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, message: "Select a collector and route date." };
+  return directoryRequest("/collection-batches", collectionBatchResponseSchema, { method: "POST", body: parsed.data });
+});
+
+ipcMain.handle("bcis:start-collection-batch", (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  return directoryRequest(`/collection-batches/${identifier.data}/start`, collectionBatchResponseSchema, {
+    method: "POST",
+  });
+});
+
+ipcMain.handle("bcis:submit-collection-batch", (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  return directoryRequest(`/collection-batches/${identifier.data}/submit`, collectionBatchResponseSchema, {
+    method: "POST",
+  });
+});
+
+ipcMain.handle("bcis:remit-collection-batch", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return { ok: false, message: split.message };
+  const parsed = remitCollectionBatchInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Enter the remitted amount." };
+  return directoryRequest(`/collection-batches/${split.id}/remit`, collectionBatchResponseSchema, {
+    method: "POST",
+    body: parsed.data,
+  });
+});
+
+ipcMain.handle("bcis:reconcile-collection-batch", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return { ok: false, message: split.message };
+  const parsed = reconcileCollectionBatchInputSchema.safeParse(split.input ?? {});
+  if (!parsed.success) return { ok: false, message: "Enter a valid reconciliation note." };
+  return directoryRequest(`/collection-batches/${split.id}/reconcile`, collectionBatchResponseSchema, {
+    method: "POST",
+    body: parsed.data,
+  });
+});
+
+ipcMain.handle("bcis:close-collection-batch", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return { ok: false, message: split.message };
+  const parsed = closeCollectionBatchInputSchema.safeParse(split.input);
+  if (!parsed.success) return { ok: false, message: "Confirm closing the collection batch." };
+  return directoryRequest(`/collection-batches/${split.id}/close`, collectionBatchResponseSchema, {
+    method: "POST",
+    body: parsed.data,
+  });
+});
+
+ipcMain.handle("bcis:get-route-sheet", (_event, id: unknown) => {
+  const identifier = identifierResult(id);
+  if (!identifier.ok) return identifier;
+  return directoryRequest(`/collection-batches/${identifier.data}/route-sheet`, routeSheetSchema);
+});
+
+ipcMain.handle("bcis:get-collector-report", (_event, params: unknown) =>
+  directoryRequest(
+    `/collector-report${queryString(listParams(params, ["from", "to"]))}`,
+    collectorReportSchema,
+  ));
+
+ipcMain.handle("bcis:get-aging-report", (_event, params: unknown) =>
+  directoryRequest(
+    `/aging-report${queryString(listParams(params, ["from"]))}`,
+    agingReportSchema,
+  ));
+
+ipcMain.handle("bcis:get-overdue-invoices", (_event, params: unknown) =>
+  directoryRequest(
+    `/overdue${queryString(listParams(params, ["from"]))}`,
+    overdueListSchema,
+  ));
+
+ipcMain.handle("bcis:list-suspension-candidates", (_event, params: unknown) =>
+  directoryRequest(
+    `/suspension-candidates${queryString(listParams(params, ["from"]))}`,
+    suspensionListSchema,
+  ));
+
+ipcMain.handle("bcis:list-suspensions", (_event, serviceAccountId: unknown) => {
+  if (typeof serviceAccountId === "string" && serviceAccountId.length > 0) {
+    const identifier = identifierResult(serviceAccountId);
+    if (!identifier.ok) return identifier;
+    return directoryRequest(`/service-accounts/${identifier.data}/suspensions`, serviceSuspensionListSchema);
+  }
+  return directoryRequest("/suspensions", serviceSuspensionListSchema);
+});
+
+ipcMain.handle("bcis:suspend-service-account", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return { ok: false, message: split.message };
+  const parsed = suspendServiceAccountInputSchema.safeParse(split.input ?? {});
+  if (!parsed.success) return { ok: false, message: "Enter valid suspension details." };
+  return directoryRequest(`/service-accounts/${split.id}/suspend`, serviceSuspensionResponseSchema, {
+    method: "POST",
+    body: parsed.data,
+  });
+});
+
+ipcMain.handle("bcis:reconnect-service-account", (_event, payload: unknown) => {
+  const split = splitPayload(payload);
+  if (!split.ok) return { ok: false, message: split.message };
+  const parsed = reconnectServiceAccountInputSchema.safeParse(split.input ?? {});
+  if (!parsed.success) return { ok: false, message: "Enter valid reconnection details." };
+  return directoryRequest(`/service-accounts/${split.id}/reconnect`, serviceSuspensionResponseSchema, {
+    method: "POST",
+    body: parsed.data,
+  });
+});
+
+const REPORT_PARAM_KEYS = ["from", "to", "asOf", "granularity", "subscriberId"] as const;
+
+ipcMain.handle("bcis:list-reports", () => directoryRequest("/reports", reportCatalogSchema));
+
+ipcMain.handle("bcis:get-dashboard", (_event, params: unknown) =>
+  directoryRequest(`/reports/dashboard${queryString(listParams(params, ["asOf"]))}`, dashboardSchema));
+
+ipcMain.handle("bcis:get-report", (_event, payload: unknown) => {
+  const source = typeof payload === "object" && payload !== null ? (payload as { key?: unknown; params?: unknown }) : {};
+  const key = typeof source.key === "string" ? source.key : "";
+  if (!key) return { ok: false as const, message: "Choose a report to open." };
+  const query = queryString(listParams(source.params, REPORT_PARAM_KEYS));
+  return directoryRequest(`/reports/${encodeURIComponent(key)}${query}`, reportSchema);
+});
+
+ipcMain.handle("bcis:export-report", async (_event, payload: unknown) => {
+  const source =
+    typeof payload === "object" && payload !== null
+      ? (payload as { key?: unknown; format?: unknown; params?: unknown })
+      : {};
+  const key = typeof source.key === "string" ? source.key : "";
+  const format = source.format === "pdf" ? "pdf" : "xlsx";
+  if (!key) return { ok: false, message: "Choose a report to export." };
+  const query = queryString(listParams(source.params, REPORT_PARAM_KEYS));
+  const result = await directoryRequest(`/reports/${encodeURIComponent(key)}/export${query}`, reportSchema);
+  if (!result.ok) return result;
+  const report = result.data;
+  const stamp = report.parameters?.asOf ?? report.generatedAt.slice(0, 10);
+  try {
+    const chosen = await dialog.showSaveDialog({
+      title: `Export ${report.title}`,
+      defaultPath: `${report.key}-${stamp}.${format}`,
+      filters:
+        format === "pdf"
+          ? [{ name: "PDF document", extensions: ["pdf"] }]
+          : [{ name: "Excel workbook", extensions: ["xlsx"] }],
+    });
+    if (chosen.canceled || !chosen.filePath) {
+      return { ok: true, data: { canceled: true, filePath: null } };
+    }
+    const buffer = format === "pdf" ? await buildReportPdf(report) : await buildReportWorkbook(report);
+    await writeFile(chosen.filePath, buffer);
+    return { ok: true, data: { canceled: false, filePath: chosen.filePath } };
+  } catch {
+    return { ok: false, message: "Unable to write the export file." };
+  }
+});
+
 function createWindow() {
   const window = new BrowserWindow({
     width: 1440,
@@ -452,7 +703,7 @@ function createWindow() {
     minHeight: 720,
     backgroundColor: "#f6f8fb",
     webPreferences: {
-      preload: path.join(currentDirectory, "../preload/index.js"),
+      preload: path.join(currentDirectory, "../preload/index.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,

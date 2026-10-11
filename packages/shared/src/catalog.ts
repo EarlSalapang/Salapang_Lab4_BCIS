@@ -353,6 +353,8 @@ export const paymentSchema = z.object({
   verifiedAt: isoDateTimeSchema.nullable().optional(),
   verifiedByUserId: identifierSchema.nullable().optional(),
   createdByUserId: identifierSchema.nullable().optional(),
+  collectorId: identifierSchema.nullable().optional(),
+  collectionBatchId: identifierSchema.nullable().optional(),
   createdAt: isoDateTimeSchema,
   updatedAt: isoDateTimeSchema,
   allocations: z.array(paymentAllocationSchema).optional(),
@@ -395,6 +397,7 @@ export const createPaymentInputSchema = z.object({
   referenceNumber: z.string().max(120).optional(),
   notes: z.string().max(500).optional(),
   paymentDate: isoDateTimeSchema.optional(),
+  collectionBatchId: identifierSchema.optional(),
   proofs: z.array(paymentProofInputSchema).max(5).optional(),
 });
 
@@ -427,6 +430,153 @@ export const allocationPreviewSchema = z.object({
       amountCents: z.number().int().min(0),
     }),
   ),
+});
+
+export const collectionBatchStatusEnum = z.enum([
+  "OPEN",
+  "IN_PROGRESS",
+  "SUBMITTED",
+  "REMITTED",
+  "RECONCILED",
+  "CLOSED",
+  "CANCELLED",
+]);
+export const batchAccountStatusEnum = z.enum(["PENDING", "COLLECTED", "PARTIAL", "SKIPPED"]);
+
+export const collectorSchema = z.object({
+  id: identifierSchema,
+  code: z.string().min(1).max(40),
+  name: z.string().min(1).max(120),
+  contactNumber: z.string().max(40).nullable().optional(),
+  isActive: z.boolean(),
+  createdAt: isoDateTimeSchema,
+  updatedAt: isoDateTimeSchema,
+});
+export const collectorListSchema = z.object({ collectors: z.array(collectorSchema) });
+export const collectorResponseSchema = z.object({ collector: collectorSchema });
+export const createCollectorInputSchema = z.object({
+  code: z.string().trim().min(2).max(40),
+  name: z.string().trim().min(3).max(120),
+  contactNumber: optionalText(40),
+});
+export const updateCollectorInputSchema = z
+  .object({
+    name: z.string().trim().min(3).max(120).optional(),
+    contactNumber: optionalText(40),
+    isActive: z.boolean().optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, { message: "Provide at least one field to update." });
+
+export const collectorAssignmentSchema = z.object({
+  id: identifierSchema,
+  collectorId: identifierSchema,
+  collectorName: z.string().min(1).max(120),
+  subscriberId: identifierSchema,
+  subscriberAccountNumber: z.string().min(1).max(50),
+  subscriberName: z.string().min(1).max(200),
+  collectionAreaId: identifierSchema.nullable().optional(),
+  collectionAreaName: z.string().nullable().optional(),
+  isActive: z.boolean(),
+  assignedAt: isoDateTimeSchema,
+});
+export const collectorAssignmentListSchema = z.object({ assignments: z.array(collectorAssignmentSchema) });
+export const createCollectorAssignmentInputSchema = z.object({
+  collectorId: identifierSchema,
+  subscriberIds: z.array(identifierSchema).min(1),
+  collectionAreaId: identifierSchema.optional(),
+});
+
+export const batchAccountSchema = z.object({
+  id: identifierSchema,
+  batchId: identifierSchema,
+  subscriberId: identifierSchema,
+  subscriberAccountNumber: z.string().min(1).max(50),
+  subscriberName: z.string().min(1).max(200),
+  addressLine: z.string().nullable().optional(),
+  currentBillCents: z.number().int().min(0),
+  arrearsCents: z.number().int().min(0),
+  expectedCents: z.number().int().min(0),
+  collectedCents: z.number().int().min(0),
+  status: batchAccountStatusEnum,
+});
+
+export const collectionBatchSchema = z.object({
+  id: identifierSchema,
+  batchNumber: z.string().min(1).max(50),
+  collectorId: identifierSchema,
+  collectorName: z.string().min(1).max(120),
+  collectionAreaId: identifierSchema.nullable().optional(),
+  collectionAreaName: z.string().nullable().optional(),
+  routeDate: isoDateSchema,
+  status: collectionBatchStatusEnum,
+  expectedCents: z.number().int().min(0),
+  cashCollectedCents: z.number().int().min(0),
+  nonCashCollectedCents: z.number().int().min(0),
+  collectedCents: z.number().int().min(0),
+  remittedCents: z.number().int().min(0).nullable().optional(),
+  differenceCents: z.number().int().nullable().optional(),
+  shortageCents: z.number().int().min(0),
+  overageCents: z.number().int().min(0),
+  notes: z.string().max(500).nullable().optional(),
+  openedByUserId: identifierSchema.nullable().optional(),
+  submittedAt: isoDateTimeSchema.nullable().optional(),
+  remittedAt: isoDateTimeSchema.nullable().optional(),
+  reconciledAt: isoDateTimeSchema.nullable().optional(),
+  closedAt: isoDateTimeSchema.nullable().optional(),
+  createdAt: isoDateTimeSchema,
+  updatedAt: isoDateTimeSchema,
+  accounts: z.array(batchAccountSchema).optional(),
+});
+
+export const collectionBatchListQuerySchema = z.object({
+  collectorId: identifierSchema.optional(),
+  status: collectionBatchStatusEnum.optional(),
+  from: isoDateSchema.optional(),
+  to: isoDateSchema.optional(),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25),
+});
+export const collectionBatchListSchema = z.object({
+  batches: z.array(collectionBatchSchema),
+  total: z.number().int().min(0),
+  page: z.number().int().min(1),
+  pageSize: z.number().int().min(1),
+});
+export const collectionBatchResponseSchema = z.object({ batch: collectionBatchSchema });
+
+export const createCollectionBatchInputSchema = z.object({
+  collectorId: identifierSchema,
+  collectionAreaId: identifierSchema.optional(),
+  routeDate: isoDateSchema,
+  notes: z.string().max(500).optional(),
+});
+export const remitCollectionBatchInputSchema = z.object({
+  amountCents: z.number().int().min(0),
+  referenceNumber: z.string().max(120).optional(),
+  notes: z.string().max(500).optional(),
+});
+export const reconcileCollectionBatchInputSchema = z.object({ note: z.string().max(500).optional() });
+export const closeCollectionBatchInputSchema = z.object({ confirm: z.literal(true) });
+
+export const routeSheetSchema = z.object({
+  batch: collectionBatchSchema,
+  accounts: z.array(batchAccountSchema),
+});
+
+export const collectorReportRowSchema = z.object({
+  collectorId: identifierSchema,
+  collectorName: z.string().min(1).max(120),
+  batches: z.number().int().min(0),
+  expectedCents: z.number().int().min(0),
+  collectedCents: z.number().int().min(0),
+  remittedCents: z.number().int().min(0),
+  shortageCents: z.number().int().min(0),
+  overageCents: z.number().int().min(0),
+});
+export const collectorReportSchema = z.object({
+  from: isoDateSchema.nullable().optional(),
+  to: isoDateSchema.nullable().optional(),
+  rows: z.array(collectorReportRowSchema),
 });
 
 export type ServiceType = z.infer<typeof serviceTypeSchema>;
@@ -479,3 +629,130 @@ export type VerifyPaymentInput = z.infer<typeof verifyPaymentInputSchema>;
 export type ReversePaymentInput = z.infer<typeof reversePaymentInputSchema>;
 export type AllocationPreviewInput = z.infer<typeof allocationPreviewInputSchema>;
 export type AllocationPreview = z.infer<typeof allocationPreviewSchema>;
+export type CollectionBatchStatus = z.infer<typeof collectionBatchStatusEnum>;
+export type BatchAccountStatus = z.infer<typeof batchAccountStatusEnum>;
+export type Collector = z.infer<typeof collectorSchema>;
+export type CollectorListResponse = z.infer<typeof collectorListSchema>;
+export type CollectorResponse = z.infer<typeof collectorResponseSchema>;
+export type CreateCollectorInput = z.infer<typeof createCollectorInputSchema>;
+export type UpdateCollectorInput = z.infer<typeof updateCollectorInputSchema>;
+export type CollectorAssignment = z.infer<typeof collectorAssignmentSchema>;
+export type CollectorAssignmentListResponse = z.infer<typeof collectorAssignmentListSchema>;
+export type CreateCollectorAssignmentInput = z.infer<typeof createCollectorAssignmentInputSchema>;
+export type BatchAccount = z.infer<typeof batchAccountSchema>;
+export type CollectionBatch = z.infer<typeof collectionBatchSchema>;
+export type CollectionBatchListQuery = z.infer<typeof collectionBatchListQuerySchema>;
+export type CollectionBatchListResponse = z.infer<typeof collectionBatchListSchema>;
+export type CollectionBatchResponse = z.infer<typeof collectionBatchResponseSchema>;
+export type CreateCollectionBatchInput = z.infer<typeof createCollectionBatchInputSchema>;
+export type RemitCollectionBatchInput = z.infer<typeof remitCollectionBatchInputSchema>;
+export type ReconcileCollectionBatchInput = z.infer<typeof reconcileCollectionBatchInputSchema>;
+export type CloseCollectionBatchInput = z.infer<typeof closeCollectionBatchInputSchema>;
+export type RouteSheet = z.infer<typeof routeSheetSchema>;
+export type CollectorReportRow = z.infer<typeof collectorReportRowSchema>;
+export type CollectorReport = z.infer<typeof collectorReportSchema>;
+
+
+export type AgingBucket = z.infer<typeof agingBucketSchema>;
+export type AgingReportRow = z.infer<typeof agingReportRowSchema>;
+export type AgingReport = z.infer<typeof agingReportSchema>;
+export type OverdueInvoice = z.infer<typeof overdueInvoiceSchema>;
+export type OverdueList = z.infer<typeof overdueListSchema>;
+export type SuspensionCandidate = z.infer<typeof suspensionCandidateSchema>;
+export type SuspensionList = z.infer<typeof suspensionListSchema>;
+export type ServiceSuspension = z.infer<typeof serviceSuspensionSchema>;
+export type SuspendServiceAccountInput = z.infer<typeof suspendServiceAccountInputSchema>;
+export type ReconnectServiceAccountInput = z.infer<typeof reconnectServiceAccountInputSchema>;
+export const agingBucketSchema = z.object({
+  label: z.string(),
+  minDays: z.number().int().min(-9999).nullable().optional(),
+  maxDays: z.number().int().nullable().optional(),
+  amountCents: z.number().int().min(0),
+  count: z.number().int().min(0),
+});
+
+export const agingReportRowSchema = z.object({
+  subscriberId: identifierSchema,
+  subscriberAccountNumber: z.string(),
+  subscriberName: z.string(),
+  totalBalanceCents: z.number().int().min(0),
+  currentCents: z.number().int().min(0),
+  buckets: z.array(agingBucketSchema),
+});
+
+export const agingReportSchema = z.object({
+  asOf: isoDateSchema,
+  buckets: z.array(z.object({ label: z.string(), minDays: z.number().int().nullable().optional(), maxDays: z.number().int().nullable().optional() })),
+  rows: z.array(agingReportRowSchema),
+  totals: z.object({ totalBalanceCents: z.number().int().min(0), currentCents: z.number().int().min(0) }),
+});
+
+export const overdueInvoiceSchema = z.object({
+  id: identifierSchema,
+  invoiceNumber: z.string(),
+  subscriberId: identifierSchema,
+  subscriberAccountNumber: z.string(),
+  subscriberName: z.string(),
+  dueDate: isoDateSchema,
+  issueDate: isoDateSchema,
+  totalCents: z.number().int().min(0),
+  amountPaidCents: z.number().int().min(0),
+  balanceCents: z.number().int().min(0),
+  daysOverdue: z.number().int().min(0),
+  status: invoiceStatusEnum,
+});
+
+export const overdueListSchema = z.object({
+  asOf: isoDateSchema,
+  invoices: z.array(overdueInvoiceSchema),
+  totalBalanceCents: z.number().int().min(0),
+  count: z.number().int().min(0),
+});
+
+export const suspensionCandidateSchema = z.object({
+  subscriberId: identifierSchema,
+  subscriberAccountNumber: z.string(),
+  subscriberName: z.string(),
+  serviceAccountId: identifierSchema,
+  serviceAccountNumber: z.string(),
+  totalOverdueCents: z.number().int().min(0),
+  oldestOverdueDays: z.number().int().min(0),
+  invoiceCount: z.number().int().min(0),
+});
+
+export const suspensionListSchema = z.object({
+  asOf: isoDateSchema,
+  candidates: z.array(suspensionCandidateSchema),
+});
+
+export const serviceSuspensionSchema = z.object({
+  id: identifierSchema,
+  serviceAccountId: identifierSchema,
+  subscriberId: identifierSchema,
+  reason: z.string().nullable(),
+  notes: z.string().nullable(),
+  suspendedAt: isoDateTimeSchema,
+  suspendedByUserId: identifierSchema.nullable(),
+  reconnectedAt: isoDateTimeSchema.nullable(),
+  reconnectedByUserId: identifierSchema.nullable(),
+  reconnectionReason: z.string().nullable(),
+});
+
+export const serviceSuspensionListSchema = z.object({
+  suspensions: z.array(serviceSuspensionSchema),
+});
+
+export const serviceSuspensionResponseSchema = z.object({ suspension: serviceSuspensionSchema });
+
+export const suspendServiceAccountInputSchema = z.object({
+  reason: z.string().trim().min(3).max(200).optional(),
+  notes: z.string().trim().max(500).optional(),
+});
+
+export const reconnectServiceAccountInputSchema = z.object({
+  reason: z.string().trim().min(3).max(200).optional(),
+  notes: z.string().trim().max(500).optional(),
+});
+
+export type ServiceSuspensionListResponse = z.infer<typeof serviceSuspensionListSchema>;
+export type ServiceSuspensionResponse = z.infer<typeof serviceSuspensionResponseSchema>;

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 
 import { buildServer } from "./app.js";
+import { PostgresAuditStore } from "./audit/postgres-store.js";
 import { PostgresAuthStore } from "./auth/postgres-store.js";
 import { PostgresDirectoryStore } from "./catalog/postgres-store.js";
 import { config } from "./config.js";
@@ -15,6 +16,7 @@ const https = config.API_TLS_CERT_FILE && config.API_TLS_KEY_FILE
 const server = buildServer(pool, new PostgresAuthStore(pool), {
   https,
   directory: new PostgresDirectoryStore(pool),
+  audit: new PostgresAuditStore(pool),
 });
 
 server.addHook("onClose", async () => {

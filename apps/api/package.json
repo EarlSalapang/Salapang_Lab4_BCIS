@@ -11,7 +11,11 @@
     "test": "vitest run src",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/migrate.ts",
-    "db:seed-admin": "tsx src/seed-admin.ts"
+    "db:seed-admin": "tsx src/seed-admin.ts",
+    "db:seed-demo": "tsx src/seed-demo.ts",
+    "db:integrity": "tsx src/integrity.ts",
+    "db:backup": "tsx src/backup.ts",
+    "db:restore": "tsx src/restore.ts"
   },
   "dependencies": {
     "dotenv": "^16.0.0",
